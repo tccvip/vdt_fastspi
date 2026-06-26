@@ -350,6 +350,7 @@ Rule classification engine phải hỗ trợ các kiểu điều kiện khớp s
 | IPv4 Subnet Match | IP nguồn hoặc đích khớp với tiền tố CIDR | src_ip = 10.0.0.0/24 |
 | Port Range Match | Cổng nguồn hoặc đích nằm trong phạm vi | dst_port = 80–443 |
 | Protocol Match | Giao thức IP khớp với giá trị chỉ định | protocol = TCP |
+| IPv4 Exact Address Match | Source hoặc destination IP khớp với một địa chỉ IPv4 đơn cụ thể (host address, không phải prefix) | dst_ip = 69.220.144.5 |
 
 Nhiều điều kiện trên các trường khác nhau trong một rule duy nhất phải được kết hợp theo ngữ nghĩa logic AND. Một gói tin khớp với một rule chỉ khi tất cả các điều kiện được chỉ định trong rule đó đều được thỏa mãn.
 
@@ -361,6 +362,7 @@ Hệ thống phải hỗ trợ hai chế độ so khớp rule, có thể lựa c
 - **Best-Match:** Rule khớp có độ đặc hiệu cao nhất, được xác định theo ưu tiên phân loại, sẽ được áp dụng.
 
 Nếu không có chế độ so khớp nào được cấu hình tường minh, hệ thống phải mặc định theo hành vi first-match.
+Một filter-group có thể có nhiều precedence khác nhau tương ứng với các rule con có điều kiện khác nhau (ví dụ: khác protocol).
 
 **FR-017 — Rule Mặc Định (Default Rule)**
 
@@ -661,34 +663,38 @@ Mỗi mục rule trong file cấu hình phải chỉ định các trường sau:
 | Tên Rule | Có | Mã định danh chữ-số duy nhất cho rule |
 | Filter Group | Có | Tên nhóm mà rule này thuộc về |
 | Giao thức | Có | TCP, UDP hoặc wildcard (*) |
-| IP nguồn | Có | Địa chỉ IPv4, tiền tố CIDR hoặc wildcard (*) |
-| IP đích | Có | Địa chỉ IPv4, tiền tố CIDR hoặc wildcard (*) |
+| IP nguồn | Có | Địa chỉ IPv4 |
+| IP nguồn prefix | Có | Tiền tố CIDR |
+| IP đích | Có | Địa chỉ IPv4 |
+| IP đích prefix | Có | Tiền tố CIDR |
 | Cổng nguồn | Có | Số cổng, phạm vi cổng (min–max) hoặc wildcard (*) |
 | Cổng đích | Có | Số cổng, phạm vi cổng (min–max) hoặc wildcard (*) |
 
 **RC-003 — Khai Báo Hành Động Filter Group**
 
-Mỗi filter group được đặt tên trong file rule phải có một khai báo hành động liên kết chỉ định FORWARD hoặc DROP. Tất cả rule trong cùng một filter group dùng chung cùng một hành động.
+Mỗi filter group có khai báo action và precedence. Mỗi action liên kết chỉ định FORWARD hoặc DROP. Mỗi precedence khai báo số nguyên thứ tự ưu tiên của group. Giá trị thấp hơn = ưu tiên cao hơn. Trường Precedence cần được định nghĩa ở cấp rule, không phải chỉ ở cấp group declaration.
 
 **RC-004 — Ví Dụ File Rule**
 
 Ví dụ dưới đây minh họa định dạng cấu hình rule yêu cầu. Cú pháp chính xác sẽ được định nghĩa trong SDD.
 
 ```
-# Định nghĩa Filter Group
-[group: WEB_TRAFFIC]    action=FORWARD
-[group: DNS_TRAFFIC]    action=FORWARD
-[group: GTPU_TRAFFIC]   action=FORWARD
-[group: BLOCKED]        action=DROP
-[group: DEFAULT]        action=DROP
+# Filter Group Definitions (với Precedence)
+[group: fg_l34_facebook]     precedence=100  action=FORWARD
+[group: fg_l34_youtube]      precedence=101  action=FORWARD
+[group: fg_l34_http_sdf1003] precedence=102  action=FORWARD
+[group: fg_l34_dns_sdf1005]  precedence=104  action=FORWARD
+[group: fg_l34_dns_sdf1005]  precedence=105  action=FORWARD
+[group: DEFAULT]             precedence=999  action=DROP
 
-# Định nghĩa Rule
-HTTP_RULE,     WEB_TRAFFIC,  TCP, *, *, *, 80
-HTTPS_RULE,    WEB_TRAFFIC,  TCP, *, *, *, 443
-DNS_RULE,      DNS_TRAFFIC,  UDP, *, *, *, 53
-GTPU_RULE,     GTPU_TRAFFIC, UDP, *, *, *, 2152
-SSH_BLOCK,     BLOCKED,      TCP, *, *, *, 22
-DEFAULT_RULE,  DEFAULT,      *,   *, *, *, *
+# Rule Definitions (prefix = CIDR, address = exact host IP)
+f_l34_facebook_1, fg_l34_facebook, any, dst_prefix=31.13.64.0/18,  any, any
+f_l34_facebook_4, fg_l34_facebook, any, dst_address=69.220.144.5,  any, any
+f_l34_youtube_1,  fg_l34_youtube,  tcp, dst_prefix=142.250.0.0/15, 443, any
+f_l34_youtube_4,  fg_l34_youtube,  tcp, dst_address=74.125.0.1,    443, any
+f_l34_http_all,   fg_l34_http_sdf1003, tcp, any, 80, any
+f_l34_dns_udp,    fg_l34_dns_sdf1005,  udp, any, 53, any
+f_l34_dns_tcp,    fg_l34_dns_sdf1005,  tcp, any, 53, any
 ```
 
 **RC-005 — Hỗ Trợ Chú Thích**
