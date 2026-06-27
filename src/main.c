@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <getopt.h>
 
 #include <rte_eal.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
+#include <rte_cycles.h>
 #include <rte_common.h>
 
 #include "dpdk/dpdk_init.h"
@@ -32,7 +34,7 @@ static worker_lcore_stats_t  g_worker_stats[SPIFAST_MAX_GROUPS];
 static rx_ctx_t              g_rx_ctx;
 static worker_ctx_t          g_worker_ctx[SPIFAST_MAX_GROUPS];
 
-/* Shutdown flag shared with workers (SDD §6.6) */
+/* Set to 1 by the RX lcore when PCAP replay ends; polled by workers and main. */
 volatile int g_shutdown_flag = 0;
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -61,57 +63,170 @@ static void usage(const char *prog)
  * ───────────────────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
-    /* TODO: Step 1 — Split EAL args from application args at "--" separator. */
+    /* ── Step 1: split argv at "--" ──────────────────────────────────────────
+     * EAL receives argv[0..sep-1]; app receives argv[sep+1..argc-1].
+     * argv[0] (program name) is prepended to app_argv so getopt starts at [1]. */
+    int sep = argc;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) { sep = i; break; }
+    }
+    int eal_argc = sep;
 
-    /* TODO: Step 2 — Parse application args with getopt_long.
-     *   --pcap  : mandatory; verify file is readable.
-     *   --rules : optional, default "spi_rules.conf".
-     *   --workers : optional, default 1; must be ≥ 1.
-     *   --log   : optional; stored in g_config.log_path.
-     *   --mode  : optional, default "first".
-     *   On validation failure: usage(); exit(EXIT_FAILURE).  */
+#define SPIFAST_APP_ARGC_MAX 64
+    char *app_argv[SPIFAST_APP_ARGC_MAX];
+    int   app_argc = 0;
+    app_argv[app_argc++] = argv[0];
+    for (int i = sep + 1; i < argc && app_argc < SPIFAST_APP_ARGC_MAX - 1; i++)
+        app_argv[app_argc++] = argv[i];
+    app_argv[app_argc] = NULL;
 
-    /* TODO: Step 3 — Initialise DPDK (EAL, mempool, net_pcap port, rings).
-     *   dpdk_init(&g_config, &g_dpdk);
-     *   Verify total available lcores ≥ 2 + num_workers.  */
+    /* ── Step 2: parse application arguments ─────────────────────────────────
+     * Defaults: rules=spi_rules.conf, workers=1, mode=first, log=(none). */
+    memset(&g_config, 0, sizeof(g_config));
+    strncpy(g_config.rules_path, "spi_rules.conf",
+            sizeof(g_config.rules_path) - 1);
+    g_config.num_workers        = 1;
+    g_config.match_mode         = MATCH_MODE_FIRST;
+    g_config.stats_interval_sec = 1;
 
-    /* TODO: Step 4 — Open log file (if --log was supplied).
-     *   log_open(g_config.log_path);  */
+    int pcap_set = 0;
+    int opt;
+    while ((opt = getopt_long(app_argc, app_argv, "", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'p':
+            strncpy(g_config.pcap_path, optarg,
+                    sizeof(g_config.pcap_path) - 1);
+            pcap_set = 1;
+            break;
+        case 'r':
+            strncpy(g_config.rules_path, optarg,
+                    sizeof(g_config.rules_path) - 1);
+            break;
+        case 'w': {
+            long n = strtol(optarg, NULL, 10);
+            if (n < 1 || n > (long)SPIFAST_MAX_GROUPS) {
+                fprintf(stderr,
+                        "[SPIFAST ERROR] --workers must be 1..%d\n",
+                        SPIFAST_MAX_GROUPS);
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            g_config.num_workers = (uint32_t)n;
+            break;
+        }
+        case 'l':
+            strncpy(g_config.log_path, optarg,
+                    sizeof(g_config.log_path) - 1);
+            break;
+        case 'm':
+            if (strcmp(optarg, "best") == 0)
+                g_config.match_mode = MATCH_MODE_BEST;
+            else if (strcmp(optarg, "first") == 0)
+                g_config.match_mode = MATCH_MODE_FIRST;
+            else {
+                fprintf(stderr,
+                        "[SPIFAST ERROR] --mode must be 'first' or 'best'\n");
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            break;
+        default:
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
 
-    /* TODO: Step 5 — Load and compile rules.
-     *   rule_loader_load(g_config.rules_path, &g_group_table,
-     *                    g_rules, &g_num_rules);
-     *   On failure: exit(EXIT_FAILURE).  */
+    if (!pcap_set) {
+        fprintf(stderr, "[SPIFAST ERROR] --pcap is required\n");
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
 
-    /* TODO: Step 6 — Log startup event.
-     *   log_startup_event(&g_config, g_rules, g_num_rules, &g_group_table);  */
+    /* Verify the pcap file is readable before the DPDK PMD tries to open it */
+    {
+        FILE *f = fopen(g_config.pcap_path, "r");
+        if (f == NULL) {
+            fprintf(stderr,
+                    "[SPIFAST ERROR] cannot open pcap file '%s': %s\n",
+                    g_config.pcap_path, strerror(errno));
+            return EXIT_FAILURE;
+        }
+        fclose(f);
+    }
 
-    /* TODO: Step 7 — Initialise stats context and launch lcores.
-     *   stats_ctx_t stats_ctx = { &g_rx_stats, g_worker_stats,
-     *                              g_config.num_workers, g_group_table.num_groups };
-     *   stats_init(&stats_ctx);
-     *   rte_eal_remote_launch(rx_lcore_func,     &g_rx_ctx,         rx_lcore_id);
-     *   for each worker i:
-     *     rte_eal_remote_launch(worker_lcore_func, &g_worker_ctx[i], worker_lcore_id[i]);  */
+    /* ── Step 3: initialise DPDK — EAL, mempool, net_pcap port, rings, lcores */
+    dpdk_init(eal_argc, argv, &g_config, &g_dpdk);
 
-    /* TODO: Step 8 — Main lcore stats loop (SDD §6.4).
-     *   Poll wall clock; call stats_collect() + log_periodic() every 1 second.
-     *   rte_delay_us_block(100) between polls to avoid spinning.
-     *   Exit loop when all remote lcores have finished.  */
+    /* ── Step 4: open log file (log_open silently skips if path is empty) ──── */
+    log_open(g_config.log_path);
 
-    /* TODO: Step 9 — Wait for all lcores.
-     *   rte_eal_mp_wait_lcore();  */
+    /* ── Step 5: load rule file and compile ACL context ─────────────────────── */
+    if (rule_loader_load(g_config.rules_path, &g_group_table,
+                         g_rules, &g_num_rules) != 0) {
+        fprintf(stderr,
+                "[SPIFAST ERROR] Failed to load rules from '%s'\n",
+                g_config.rules_path);
+        log_close();
+        dpdk_cleanup(&g_dpdk);
+        rte_eal_cleanup();
+        return EXIT_FAILURE;
+    }
 
-    /* TODO: Step 10 — Final summary, cleanup.
-     *   stats_snapshot_t final = stats_collect();
-     *   validate_packet_accounting(&final);
-     *   log_final_summary(&final, &g_group_table);
-     *   log_close();
-     *   acl_engine_destroy();
-     *   dpdk_cleanup(&g_dpdk);
-     *   rte_eal_cleanup();  */
+    /* ── Step 6: emit STARTUP / RULES_LOADED / RULE log lines ──────────────── */
+    log_startup_event(&g_config, g_rules, g_num_rules, &g_group_table);
 
-    (void)argc; (void)argv;
-    usage(argv[0]);
+    /* ── Step 7: wire contexts, init stats, launch remote lcores ────────────── */
+    stats_ctx_t stats_ctx = {
+        .rx_stats     = &g_rx_stats,
+        .worker_stats = g_worker_stats,
+        .num_workers  = g_config.num_workers,
+        .num_groups   = g_group_table.num_groups,
+    };
+    stats_init(&stats_ctx);
+
+    g_rx_ctx.port_id     = g_dpdk.port_id;
+    g_rx_ctx.num_workers = g_config.num_workers;
+    g_rx_ctx.stats       = &g_rx_stats;
+    for (uint32_t i = 0; i < g_config.num_workers; i++)
+        g_rx_ctx.worker_rings[i] = g_dpdk.worker_rings[i];
+
+    for (uint32_t i = 0; i < g_config.num_workers; i++) {
+        g_worker_ctx[i].ring       = g_dpdk.worker_rings[i];
+        g_worker_ctx[i].worker_idx = i;
+        g_worker_ctx[i].stats      = &g_worker_stats[i];
+    }
+
+    rte_eal_remote_launch(rx_lcore_func, &g_rx_ctx, g_dpdk.rx_lcore_id);
+    for (uint32_t i = 0; i < g_config.num_workers; i++)
+        rte_eal_remote_launch(worker_lcore_func, &g_worker_ctx[i],
+                              g_dpdk.worker_lcore_ids[i]);
+
+    /* ── Step 8: main lcore stats loop — 100 µs poll, 1 s collection interval  */
+    uint64_t hz           = rte_get_timer_hz();
+    uint64_t interval_cyc = (uint64_t)g_config.stats_interval_sec * hz;
+    uint64_t last_collect = rte_get_timer_cycles();
+
+    while (!g_shutdown_flag) {
+        rte_delay_us_block(100);
+        uint64_t now = rte_get_timer_cycles();
+        if ((now - last_collect) >= interval_cyc) {
+            stats_snapshot_t snap = stats_collect();
+            log_periodic(&snap, &g_group_table);
+            last_collect = now;
+        }
+    }
+
+    /* ── Step 9: wait for RX lcore and all workers to return ────────────────── */
+    rte_eal_mp_wait_lcore();
+
+    /* ── Step 10: final summary, accounting validation, ordered teardown ─────── */
+    stats_snapshot_t final_snap = stats_collect();
+    validate_packet_accounting(&final_snap);
+    log_final_summary(&final_snap, &g_group_table);
+    log_close();
+    acl_engine_destroy();
+    dpdk_cleanup(&g_dpdk);
+    rte_eal_cleanup();
+
     return EXIT_SUCCESS;
 }

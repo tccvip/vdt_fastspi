@@ -69,6 +69,24 @@ target_link_libraries(spifast PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Unit tests  (no EAL init required — fake rte_mbuf via buf_addr/data_off)
+# Build: cmake --build build --target test_parser
+# Run:   build/test_parser
+# ─────────────────────────────────────────────────────────────────────────────
+add_executable(test_parser
+    tests/test_parser.c
+    src/packet/parser.c
+)
+target_include_directories(test_parser PRIVATE src ${DPDK_INCLUDE_DIRS})
+target_compile_options(test_parser PRIVATE ${DPDK_CFLAGS_OTHER})
+target_link_options(test_parser PRIVATE ${DPDK_LDFLAGS})
+target_link_libraries(test_parser PRIVATE
+    ${DPDK_LIBRARIES}
+    ${PCAP_LIBRARY}
+    m pthread dl numa
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Install
 # ─────────────────────────────────────────────────────────────────────────────
 install(TARGETS spifast RUNTIME DESTINATION bin)
