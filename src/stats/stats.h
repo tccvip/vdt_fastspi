@@ -2,10 +2,9 @@
 #define SPIFAST_STATS_H
 
 #include <stdint.h>
-#include "dpdk/dpdk_init.h"      /* SPIFAST_MAX_GROUPS */
-#include "packet/rx.h"           /* rx_lcore_stats_t   */
-#include "worker/worker.h"       /* worker_lcore_stats_t */
-#include "rule/acl_engine.h"     /* acl_hit_counters_t   */
+#include "dpdk/dpdk_init.h"      /* SPIFAST_MAX_GROUPS     */
+#include "packet/rx.h"           /* rx_lcore_stats_t       */
+#include "worker/worker.h"       /* worker_lcore_stats_t   */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Statistics snapshot — produced each interval; consumed by log.c  (SDD §3.6)

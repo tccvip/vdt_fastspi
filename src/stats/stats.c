@@ -4,7 +4,6 @@
 #include <rte_cycles.h>
 
 #include "stats.h"
-#include "rule/acl_engine.h"   /* acl_get_hit_counters() */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Module-private state

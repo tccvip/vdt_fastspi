@@ -6,7 +6,6 @@
 
 #include "rx.h"
 #include "parser.h"
-#include "rule/acl_engine.h"
 
 /* Defined in main.c; workers read this flag to know when to drain and exit. */
 extern volatile int g_shutdown_flag;

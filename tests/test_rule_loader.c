@@ -384,36 +384,6 @@ static void test_comments_and_blanks(void)
     EXPECT(g_num_rules == 2,    "2 rules (comments skipped)");
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Test 6: rule_loader_load() reaches acl_engine_build()
- *         acl_engine_build is a stub that returns -1, so load must also fail.
- *         This confirms the integration point between loader and ACL engine.
- * ═══════════════════════════════════════════════════════════════════════════ */
-static void test_load_reaches_acl_build(void)
-{
-    puts("[ test_load_reaches_acl_build ]");
-
-    const char *content =
-        "[group: g1]       precedence=100  action=FORWARD\n"
-        "[group: DEFAULT]  precedence=999  action=DROP\n"
-        "r1,    g1,      tcp, any, any, any, 80\n"
-        "r_def, DEFAULT, any, any, any, any, any\n";
-
-    const char *path = write_tmp("load_acl.conf", content);
-    reset();
-
-    /* rule_loader_parse should succeed */
-    int rc_parse = rule_loader_parse(path, &g_groups, g_rules, &g_num_rules);
-    EXPECT(rc_parse == 0,
-           "rule_loader_parse: parsing valid file → 0");
-
-    /* rule_loader_load must fail because acl_engine_build() is a stub (returns -1) */
-    reset();
-    int rc_load = rule_loader_load(path, &g_groups, g_rules, &g_num_rules);
-    EXPECT(rc_load == -1,
-           "rule_loader_load: fails because acl_engine_build stub returns -1");
-}
-
 /* ─── entry point ───────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -422,7 +392,6 @@ int main(void)
     test_port_range();
     test_invalid_cases();
     test_comments_and_blanks();
-    test_load_reaches_acl_build();
 
     printf("\nResult: %d passed, %d failed\n", g_pass, g_fail);
     return (g_fail == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

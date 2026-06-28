@@ -109,6 +109,27 @@ target_link_libraries(test_rule_loader PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# test_acl — two-stage ACL engine unit tests
+# Requires EAL init (--no-huge) because rte_acl_create allocates DPDK memory.
+# Links rule_loader.c and acl_engine.c for end-to-end integration.
+# Build: cmake --build build --target test_acl
+# Run:   build/test_acl
+# ─────────────────────────────────────────────────────────────────────────────
+add_executable(test_acl
+    tests/test_acl.c
+    src/rule/acl_engine.c
+    src/rule/rule_loader.c
+)
+target_include_directories(test_acl PRIVATE src ${DPDK_INCLUDE_DIRS})
+target_compile_options(test_acl PRIVATE ${DPDK_CFLAGS_OTHER})
+target_link_options(test_acl PRIVATE ${DPDK_LDFLAGS})
+target_link_libraries(test_acl PRIVATE
+    ${DPDK_LIBRARIES}
+    ${PCAP_LIBRARY}
+    m pthread dl numa
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Install
 # ─────────────────────────────────────────────────────────────────────────────
 install(TARGETS spifast RUNTIME DESTINATION bin)
