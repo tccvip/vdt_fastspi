@@ -3,46 +3,59 @@
 
 #include <stdint.h>
 #include <rte_common.h>
-#include "dpdk/dpdk_init.h"
+#include <rte_ring.h>
+#include "dpdk/dpdk_init.h"   /* CACHE_LINE_SIZE, SPIFAST_* constants */
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Per-lcore statistics for the RX / classifier lcore  (SDD §3.5)
- * Cache-line padded to prevent false sharing with worker stats.
- * Written only by the RX lcore; read by main/stats lcore without locking.
- * Occasional torn 64-bit reads by stats are acceptable (SDD §6.6).
+ * Per-lcore statistics for the RX lcore  (SDD §2.2, §3.5)
+ *
+ * Padded to exactly one cache line to prevent false sharing with adjacent
+ * stats structs (parser_lcore_stats_t, worker_lcore_stats_t).
+ * Written exclusively by the RX lcore; read by Main/stats lcore without
+ * locking.  Occasional torn 64-bit reads by stats are acceptable (SDD §6.6).
  * ───────────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    uint64_t rx_packets;          /* total mbufs received from PMD             */
-    uint64_t forward_packets;     /* mbufs enqueued to worker rings (FORWARD)  */
-    uint64_t forward_bytes;       /* byte sum of forwarded packets (pkt_len)   */
-    uint64_t drop_packets;        /* mbufs freed by rule ACTION_DROP           */
-    uint64_t invalid_packets;     /* mbufs freed due to parse failure          */
-    uint64_t ring_drop_packets;   /* mbufs freed due to full worker ring       */
-    uint8_t  _pad[CACHE_LINE_SIZE
-                  - (6 * sizeof(uint64_t)) % CACHE_LINE_SIZE];
+    uint64_t rx_packets;        /* total mbufs received (across all pcap loops)  */
+    uint64_t rx_bytes;          /* total bytes (sum of pkt_len) received          */
+    uint64_t parser_ring_drop;  /* mbufs freed because parser_ring was full       */
+    uint64_t pcap_loops;        /* number of completed passes through the pcap    */
+    uint8_t  _pad[CACHE_LINE_SIZE - 4 * sizeof(uint64_t)];
 } __rte_cache_aligned rx_lcore_stats_t;
 
+_Static_assert(sizeof(rx_lcore_stats_t) == CACHE_LINE_SIZE,
+               "rx_lcore_stats_t must occupy exactly one cache line");
+
 /* ─────────────────────────────────────────────────────────────────────────────
- * Context passed to the RX lcore function at launch  (SDD §2.2)
+ * Context passed to rx_lcore_func() at launch  (SDD §2.2)
  * ───────────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    uint16_t             port_id;
-    struct rte_ring     *worker_rings[SPIFAST_MAX_GROUPS];
-    uint32_t             num_workers;
-    rx_lcore_stats_t    *stats;           /* pointer to global stats struct  */
+    uint16_t            port_id;       /* net_pcap device; kept active for TX lcore */
+    struct rte_ring    *parser_ring;   /* SPSC ring: RX lcore → Parser lcore        */
+    rx_lcore_stats_t   *stats;
+    const char         *pcap_path;    /* path to pcap file for direct libpcap read  */
+    struct rte_mempool *mempool;      /* mbuf pool for rte_pktmbuf_alloc()           */
 } rx_ctx_t;
 
-/* Global flag: RX lcore sets this to 1 when PCAP replay finishes.
- * Workers poll it to drain their rings and exit.  SDD §2.6, §6.6 */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Global shutdown flag  (SDD §2.2, §6.6)
+ *
+ * Set to 1 by SIGINT/SIGTERM signal handler in main.c.
+ * NOT set by pcap EOF — the RX lcore loops the pcap file indefinitely.
+ * Parser, Worker, and TX lcores poll this flag to drain their rings and exit.
+ *
+ * volatile prevents compiler reordering across the flag check on reader side.
+ * ───────────────────────────────────────────────────────────────────────────── */
 extern volatile int g_shutdown_flag;
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Public API  (SDD §2.2)
+ * Public API
  * ───────────────────────────────────────────────────────────────────────────── */
 
-/* Entry point for the RX / classifier lcore (launched via rte_eal_remote_launch).
- * Receives burst → parse → ACL lookup → dispatch/drop loop.
- * Signals shutdown on PCAP end-of-input.  SDD §2.2 */
+/* Entry point for the RX lcore (launched via rte_eal_remote_launch).
+ * Reads packets from pcap file via libpcap, allocates mbufs from ctx->mempool,
+ * and enqueues into parser_ring.  On EOF, closes and reopens the pcap file to
+ * loop continuously.  Exits only when g_shutdown_flag is set (SIGINT/SIGTERM).
+ * SDD §2.2 */
 int rx_lcore_func(void *arg);
 
 #endif /* SPIFAST_RX_H */

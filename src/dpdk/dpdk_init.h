@@ -28,7 +28,7 @@
 #define SPIFAST_WORKER_BURST              32    /* Worker dequeue burst */
 #endif
 #ifndef SPIFAST_TX_BURST_SIZE
-#define SPIFAST_TX_BURST_SIZE             32    /* TX lcore drain burst */
+#define SPIFAST_TX_BURST_SIZE             64    /* TX lcore drain burst */
 #endif
 
 /* Hardware queue descriptor counts */
@@ -42,13 +42,13 @@
 /* Ring sizes — three-tier pipeline (SDD §7.3)
  * All sizes must be a power of two (rte_ring requirement). */
 #ifndef SPIFAST_PARSER_RING_SIZE
-#define SPIFAST_PARSER_RING_SIZE          1024  /* Tier 1: RX → Parser (SPSC) */
+#define SPIFAST_PARSER_RING_SIZE          4096  /* Tier 1: RX → Parser (SPSC) */
 #endif
 #ifndef SPIFAST_RING_SIZE
 #define SPIFAST_RING_SIZE                 1024  /* Tier 2: Parser → Worker[i] (SPSC) */
 #endif
 #ifndef SPIFAST_TX_RING_SIZE
-#define SPIFAST_TX_RING_SIZE              4096  /* Tier 3: Worker×N → TX (MPSC) */
+#define SPIFAST_TX_RING_SIZE              65536  /* Tier 3: Worker×N → TX (MPSC) */
 #endif
 
 /* Prefetch depth for Parser and Worker hot paths (SDD §2.3, §2.6) */
@@ -65,9 +65,7 @@
 #ifndef SPIFAST_MAX_GROUPS
 #define SPIFAST_MAX_GROUPS                4096
 #endif
-#ifndef SPIFAST_MAX_FILTERS_PER_GROUP
-#define SPIFAST_MAX_FILTERS_PER_GROUP     2048
-#endif
+/* SPIFAST_MAX_FILTERS_PER_GROUP removed — two-stage ACL model eliminated (SDD v1.2) */
 
 /* Maximum number of Worker lcores.  Distinct from SPIFAST_MAX_GROUPS, which
  * bounds the ACL group table.  Sizes the worker_rings[] and worker_lcore_ids[]
@@ -76,10 +74,10 @@
 #define SPIFAST_MAX_WORKERS               64
 #endif
 
-/* Total rule budget for the flat rules[] array in main / rule_loader.
- * A static ceiling; will migrate to dynamic allocation in a later phase. */
+/* Total rule budget for flat_rule_table_t.rules[] (SDD §7.5).
+ * Static ceiling; flat_rule_table_t lives in BSS — not stack-allocated. */
 #ifndef SPIFAST_MAX_RULES
-#define SPIFAST_MAX_RULES                 SPIFAST_MAX_GROUPS
+#define SPIFAST_MAX_RULES                 65536
 #endif
 
 /* Cache-line size for stats padding (architecture constant) */

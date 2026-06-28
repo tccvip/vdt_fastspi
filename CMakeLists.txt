@@ -41,6 +41,7 @@ set(SPIFAST_SOURCES
     src/rule/rule_loader.c
     src/rule/acl_engine.c
     src/worker/worker.c
+    src/tx/tx.c
     src/stats/stats.c
     src/logging/log.c
 )
@@ -87,10 +88,10 @@ target_link_libraries(test_parser PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# test_rule_loader — unit tests for rule parsing and validation
-# Uses rule_loader_parse() (steps 1-3 only) so EAL init is not required.
-# Links acl_engine.c to satisfy rule_loader_load()'s reference to
-# acl_engine_build() (currently a stub returning -1).
+# test_rule_loader — unit tests for flat rule parsing and validation (Phase 2)
+# Uses rule_loader_parse() (Steps 1-3, no ACL build) so EAL init is not
+# required.  acl_engine.c is linked to satisfy rule_loader_load()'s call to
+# acl_engine_build() (Phase 3 — now a real implementation, not a stub).
 # Build: cmake --build build --target test_rule_loader
 # Run:   build/test_rule_loader
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,16 +110,16 @@ target_link_libraries(test_rule_loader PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# test_acl — two-stage ACL engine unit tests
-# Requires EAL init (--no-huge) because rte_acl_create allocates DPDK memory.
-# Links rule_loader.c and acl_engine.c for end-to-end integration.
+# test_acl — unit tests for flat single-stage ACL engine (Phase 3)
+# flat_acl_match is pure C linear scan; no EAL init or hugepages required.
+# acl_engine.c is included directly.
 # Build: cmake --build build --target test_acl
 # Run:   build/test_acl
 # ─────────────────────────────────────────────────────────────────────────────
 add_executable(test_acl
     tests/test_acl.c
-    src/rule/acl_engine.c
     src/rule/rule_loader.c
+    src/rule/acl_engine.c
 )
 target_include_directories(test_acl PRIVATE src ${DPDK_INCLUDE_DIRS})
 target_compile_options(test_acl PRIVATE ${DPDK_CFLAGS_OTHER})

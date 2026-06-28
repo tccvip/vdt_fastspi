@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include "rule/rule_loader.h"
 #include "rule/acl_engine.h"
 #include "worker/worker.h"
+#include "tx/tx.h"
 #include "stats/stats.h"
 #include "logging/log.h"
 
@@ -24,18 +26,27 @@
  * ───────────────────────────────────────────────────────────────────────────── */
 static spifast_config_t      g_config;
 static dpdk_resources_t      g_dpdk;
-static filter_group_table_t  g_group_table;
-static spi_rule_t            g_rules[SPIFAST_MAX_RULES];
-static uint32_t              g_num_rules;
+static flat_rule_table_t     g_flat_rule_table;
 
 static rx_lcore_stats_t      g_rx_stats;
-static worker_lcore_stats_t  g_worker_stats[SPIFAST_MAX_GROUPS];
+static parser_lcore_stats_t  g_parser_stats;
+static worker_lcore_stats_t  g_worker_stats[SPIFAST_MAX_WORKERS];
+static tx_lcore_stats_t      g_tx_stats;
 
 static rx_ctx_t              g_rx_ctx;
-static worker_ctx_t          g_worker_ctx[SPIFAST_MAX_GROUPS];
+static parser_ctx_t          g_parser_ctx;
+static worker_ctx_t          g_worker_ctx[SPIFAST_MAX_WORKERS];
+static tx_ctx_t              g_tx_ctx;
 
-/* Set to 1 by the RX lcore when PCAP replay ends; polled by workers and main. */
+/* Set to 1 by SIGINT/SIGTERM; polled by all lcores to drain and exit.
+ * NOT set by pcap EOF — the RX lcore loops the file indefinitely. */
 volatile int g_shutdown_flag = 0;
+
+static void spifast_sighandler(int sig)
+{
+    (void)sig;
+    g_shutdown_flag = 1;   /* volatile int; single-word write is async-signal-safe */
+}
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Command-line option table  (SDD §9.1)
@@ -104,10 +115,10 @@ int main(int argc, char *argv[])
             break;
         case 'w': {
             long n = strtol(optarg, NULL, 10);
-            if (n < 1 || n > (long)SPIFAST_MAX_GROUPS) {
+            if (n < 1 || n > (long)SPIFAST_MAX_WORKERS) {
                 fprintf(stderr,
                         "[SPIFAST ERROR] --workers must be 1..%d\n",
-                        SPIFAST_MAX_GROUPS);
+                        SPIFAST_MAX_WORKERS);
                 usage(argv[0]);
                 return EXIT_FAILURE;
             }
@@ -160,9 +171,9 @@ int main(int argc, char *argv[])
     /* ── Step 4: open log file (log_open silently skips if path is empty) ──── */
     log_open(g_config.log_path);
 
-    /* ── Step 5: load rule file and compile ACL context ─────────────────────── */
-    if (rule_loader_load(g_config.rules_path, &g_group_table,
-                         g_rules, &g_num_rules) != 0) {
+    /* ── Step 5: load rule file and compile ACL index ───────────────────────── */
+    if (rule_loader_load(g_config.rules_path, g_config.match_mode,
+                         &g_flat_rule_table) != 0) {
         fprintf(stderr,
                 "[SPIFAST ERROR] Failed to load rules from '%s'\n",
                 g_config.rules_path);
@@ -173,33 +184,54 @@ int main(int argc, char *argv[])
     }
 
     /* ── Step 6: emit STARTUP / RULES_LOADED / RULE log lines ──────────────── */
-    log_startup_event(&g_config, g_rules, g_num_rules, &g_group_table);
+    log_startup_event(&g_config, &g_flat_rule_table);
 
     /* ── Step 7: wire contexts, init stats, launch remote lcores ────────────── */
     stats_ctx_t stats_ctx = {
         .rx_stats     = &g_rx_stats,
+        .parser_stats = &g_parser_stats,
         .worker_stats = g_worker_stats,
+        .worker_ctxs  = g_worker_ctx,
+        .tx_stats     = &g_tx_stats,
         .num_workers  = g_config.num_workers,
-        .num_groups   = g_group_table.num_groups,
+        .num_groups   = g_flat_rule_table.num_groups,
     };
     stats_init(&stats_ctx);
 
     g_rx_ctx.port_id     = g_dpdk.port_id;
-    g_rx_ctx.num_workers = g_config.num_workers;
+    g_rx_ctx.parser_ring = g_dpdk.parser_ring;
     g_rx_ctx.stats       = &g_rx_stats;
+    g_rx_ctx.pcap_path   = g_config.pcap_path;
+    g_rx_ctx.mempool     = g_dpdk.mempool;
+
+    g_parser_ctx.parser_ring = g_dpdk.parser_ring;
+    g_parser_ctx.num_workers = g_config.num_workers;
     for (uint32_t i = 0; i < g_config.num_workers; i++)
-        g_rx_ctx.worker_rings[i] = g_dpdk.worker_rings[i];
+        g_parser_ctx.worker_rings[i] = g_dpdk.worker_rings[i];
+    g_parser_ctx.stats = &g_parser_stats;
 
     for (uint32_t i = 0; i < g_config.num_workers; i++) {
-        g_worker_ctx[i].ring       = g_dpdk.worker_rings[i];
-        g_worker_ctx[i].worker_idx = i;
-        g_worker_ctx[i].stats      = &g_worker_stats[i];
+        g_worker_ctx[i].ring            = g_dpdk.worker_rings[i];
+        g_worker_ctx[i].tx_ring         = g_dpdk.tx_ring;
+        g_worker_ctx[i].flat_rule_table = acl_get_flat_rule_table();
+        g_worker_ctx[i].worker_idx      = i;
+        g_worker_ctx[i].stats           = &g_worker_stats[i];
     }
 
-    rte_eal_remote_launch(rx_lcore_func, &g_rx_ctx, g_dpdk.rx_lcore_id);
+    g_tx_ctx.tx_ring     = g_dpdk.tx_ring;
+    g_tx_ctx.port_id     = g_dpdk.port_id;
+    g_tx_ctx.tx_queue_id = 0;
+    g_tx_ctx.stats       = &g_tx_stats;
+
+    signal(SIGINT,  spifast_sighandler);
+    signal(SIGTERM, spifast_sighandler);
+
+    rte_eal_remote_launch(rx_lcore_func,     &g_rx_ctx,     g_dpdk.rx_lcore_id);
+    rte_eal_remote_launch(parser_lcore_func, &g_parser_ctx, g_dpdk.parser_lcore_id);
     for (uint32_t i = 0; i < g_config.num_workers; i++)
         rte_eal_remote_launch(worker_lcore_func, &g_worker_ctx[i],
                               g_dpdk.worker_lcore_ids[i]);
+    rte_eal_remote_launch(tx_lcore_func,     &g_tx_ctx,     g_dpdk.tx_lcore_id);
 
     /* ── Step 8: main lcore stats loop — 100 µs poll, 1 s collection interval  */
     uint64_t hz           = rte_get_timer_hz();
@@ -211,7 +243,7 @@ int main(int argc, char *argv[])
         uint64_t now = rte_get_timer_cycles();
         if ((now - last_collect) >= interval_cyc) {
             stats_snapshot_t snap = stats_collect();
-            log_periodic(&snap, &g_group_table);
+            log_periodic(&snap, &g_flat_rule_table);
             last_collect = now;
         }
     }
@@ -222,7 +254,7 @@ int main(int argc, char *argv[])
     /* ── Step 10: final summary, accounting validation, ordered teardown ─────── */
     stats_snapshot_t final_snap = stats_collect();
     validate_packet_accounting(&final_snap);
-    log_final_summary(&final_snap, &g_group_table);
+    log_final_summary(&final_snap, &g_flat_rule_table);
     log_close();
     acl_engine_destroy();
     dpdk_cleanup(&g_dpdk);

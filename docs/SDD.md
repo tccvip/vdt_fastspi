@@ -6,7 +6,7 @@
 
 **Mã tài liệu:** SPIFAST-SDD-001
 
-**Phiên bản:** 1.1
+**Phiên bản:** 1.2
 
 **Trạng thái:** Draft
 
@@ -31,6 +31,7 @@
 | 0.1 | 2025-06-26 | Kỹ thuật hệ thống | Bản thảo SDD ban đầu |
 | 1.0 | 2025-06-26 | Kỹ thuật hệ thống | Baseline SDD căn chỉnh với HLD v1.1 và SRS v1.0 |
 | 1.1 | 2025-06-28 | Kỹ thuật hệ thống | Cập nhật theo HLD v1.3: pipeline 5 giai đoạn; tách Parser lcore riêng; ACL classify batch two-stage tại Worker; thêm TX lcore; ba tầng ring SPSC/SPSC/MPSC; metadata qua mbuf headroom; hash dispatch tại Parser |
+| 1.2 | 2026-06-28 | Kỹ thuật hệ thống | Mục 4: Thay thế Two-Stage ACL (stage1_ctx + group_ctx[]) bằng Flat Single-Stage ACL (flat_acl_ctx + flat_rule_table_t); loại bỏ lazy build, filter_group_table, acl_result_t; giữ nguyên ACL field definitions và worker burst interface |
 
 ---
 
@@ -74,10 +75,10 @@ spifast/
 │   ├── rule/
 │   │   ├── rule_loader.c  # Phân tích file rule, kiểm tra hợp lệ, bảng filter-group
 │   │   ├── rule_loader.h
-│   │   ├── acl_engine.c   # Build two-stage ACL (stage1_ctx + group_ctx[]); batch lookup
+│   │   ├── acl_engine.c   # Build flat single-stage ACL (flat_acl_ctx); single-step batch lookup
 │   │   └── acl_engine.h
 │   ├── worker/
-│   │   ├── worker.c       # Worker lcore: dequeue, đọc headroom, batch two-stage ACL, FORWARD/DROP
+│   │   ├── worker.c       # Worker lcore: dequeue, đọc headroom, single-stage flat ACL, FORWARD/DROP
 │   │   └── worker.h
 │   ├── tx/
 │   │   ├── tx.c           # TX lcore: drain tx_ring, rte_eth_tx_burst, sở hữu TX queue
@@ -100,9 +101,9 @@ spifast/
 | `dpdk/dpdk_init` | Khởi tạo DPDK | EAL init; cấp phát mempool; cấu hình port; tạo parser_ring (SPSC), worker_ring[i] (SPSC), tx_ring (MPSC) |
 | `packet/rx` | RX lcore | Poll-mode burst RX; lightweight hash trên IP src offset; enqueue mbuf pointer vào parser_ring; phát hiện kết thúc PCAP |
 | `packet/parser` | Parser lcore | Dequeue từ parser_ring; prefetch mbuf data; parse L2/VLAN/L3/L4; flow normalization; ghi five-tuple metadata vào mbuf headroom; hash dispatch chọn worker_ring[i] |
-| `rule/rule_loader` | ACL Rule Engine (giai đoạn nạp) | Phân tích file rule; kiểm tra hợp lệ trường; xây dựng bảng filter-group |
-| `rule/acl_engine` | ACL Rule Engine (giai đoạn build + lookup) | Build stage1_ctx (group representative rules) và group_ctx[i] (per-group filter rules, lazy); batch two-stage lookup được gọi từ Worker lcore |
-| `worker/worker` | Worker lcore | Dequeue burst từ worker_ring; đọc metadata từ mbuf headroom; batch two-stage ACL classify; FORWARD → enqueue tx_ring; DROP → rte_pktmbuf_free |
+| `rule/rule_loader` | ACL Rule Engine (giai đoạn nạp) | Phân tích file rule; kiểm tra hợp lệ trường; xây dựng `flat_rule_table_t` với action nhúng trực tiếp trong mỗi entry |
+| `rule/acl_engine` | ACL Rule Engine (giai đoạn build + lookup) | Build `flat_acl_ctx` duy nhất từ `flat_rule_table_t`; cung cấp single-stage batch lookup được gọi từ Worker lcore |
+| `worker/worker` | Worker lcore | Dequeue burst từ worker_ring; đọc metadata từ mbuf headroom; single-stage flat ACL classify; tra cứu action từ flat_rule_table; FORWARD → enqueue tx_ring; DROP → rte_pktmbuf_free |
 | `tx/tx` | TX lcore | Drain tx_ring (MPSC); rte_eth_tx_burst(); sở hữu TX queue duy nhất; xử lý mbuf chưa gửi được |
 | `stats/stats` | Statistics Component | Tổng hợp counter lock-free từ tất cả lcore (RX, Parser, Worker×N, TX); tính Mbps và PPS |
 | `logging/log` | Logging Component | Xuất log định kỳ và cuối phiên ra stdout và file log tùy chọn; quản lý dual-output |
@@ -112,15 +113,15 @@ spifast/
 ```
 main
  ├── dpdk_init        (gọi đầu tiên; tạo parser_ring, worker_ring[], tx_ring)
- ├── rule_loader      (gọi sau EAL; tạo ra bảng rule và group table)
- │    └── acl_engine  (build stage1_ctx + khởi tạo group_ctx[] lazy array)
+ ├── rule_loader      (gọi sau EAL; xây dựng flat_rule_table_t)
+ │    └── acl_engine  (build flat_acl_ctx duy nhất từ flat_rule_table_t)
  ├── log              (mở sau khi config đã biết)
  ├── rx               (khởi chạy trên RX lcore; poll NIC → enqueue parser_ring)
  ├── parser           (khởi chạy trên Parser lcore; dequeue parser_ring →
  │                     parse → write headroom → hash dispatch → worker_ring[i])
  ├── worker×N         (khởi chạy trên N Worker lcore; dequeue worker_ring →
- │                     batch two-stage ACL → FORWARD→tx_ring | DROP→free)
- │    └── acl_engine  (batch lookup, read-only stage1_ctx + group_ctx[])
+ │                     single-stage flat ACL → FORWARD→tx_ring | DROP→free)
+ │    └── acl_engine  (flat lookup: read-only flat_acl_ctx + flat_rule_table)
  ├── tx               (khởi chạy trên TX lcore; drain tx_ring → rte_eth_tx_burst)
  └── stats            (chạy trên timer của main lcore; đọc counter từ tất cả lcore)
       └── log         (stats kích hoạt xuất log)
@@ -376,7 +377,7 @@ drop_invalid:
 
 `worker_idx = rte_hash_crc(&meta, sizeof(pkt_meta_t), seed) % N_workers`
 
-Hàm hash sử dụng five-tuple đã chuẩn hóa (sau `normalize_flow`) làm input. Cùng một flow (cùng five-tuple) luôn được điều phối về cùng một Worker lcore, đảm bảo flow affinity và warm cache ACL Stage-2 context per-worker. Parser lcore là điểm duy nhất trong pipeline có đủ five-tuple đã parse để thực hiện hash chính xác (DD-14).
+Hàm hash sử dụng five-tuple đã chuẩn hóa (sau `normalize_flow`) làm input. Cùng một flow (cùng five-tuple) luôn được điều phối về cùng một Worker lcore, đảm bảo flow affinity và cache locality của `flat_acl_ctx` per-worker sau warm-up. Parser lcore là điểm duy nhất trong pipeline có đủ five-tuple đã parse để thực hiện hash chính xác (DD-14).
 
 **Thuật toán chuẩn hóa luồng (`normalize_flow`):**
 
@@ -395,43 +396,44 @@ Phép biến đổi thuần túy, thời gian hằng số, phi trạng thái. Đ
 
 ### 2.4 Module Nạp Rule (`rule/rule_loader`)
 
-**Trách nhiệm:** Đọc, phân tích và kiểm tra hợp lệ file cấu hình rule; xây dựng bảng filter-group trong bộ nhớ; gọi `acl_engine` để biên dịch cấu trúc tra cứu ACL.
+**Trách nhiệm:** Đọc, phân tích và kiểm tra hợp lệ file cấu hình rule; xây dựng `flat_rule_table_t` với action (FORWARD/DROP) và `group_idx` đã được nhúng trực tiếp vào mỗi entry; gọi `acl_engine_build()` để biên dịch `flat_acl_ctx`.
 
-**Đầu vào:** Chuỗi đường dẫn file từ `spifast_config_t`.
+**Đầu vào:** Chuỗi đường dẫn file từ `spifast_config_t`; `match_mode_t` từ `--mode`.
 
-**Đầu ra:** `filter_group_table_t` đã điền và ACL context đã biên dịch (thông qua `acl_engine`). Trả về 0 khi thành công, -1 khi có bất kỳ lỗi nào.
+**Đầu ra:** `flat_rule_table_t` đã điền đầy đủ (rules[] + group_names[]) và `flat_acl_ctx` đã biên dịch (thông qua `acl_engine_build`). Trả về 0 khi thành công, -1 khi có bất kỳ lỗi nào.
 
 **Xử lý nội bộ — xem Mục 5 để biết ngữ pháp đầy đủ.**
 
-**Giao tiếp:** Gọi `acl_engine_build()` sau khi tất cả rule đã được kiểm tra hợp lệ. Cung cấp `filter_group_table` cho `acl_engine` để giải quyết action.
+**Giao tiếp:** Gọi `acl_engine_build(flat_rule_table, match_mode)` sau khi tất cả rule đã được kiểm tra hợp lệ và `flat_rule_table` đã điền xong. Không còn truyền `filter_group_table` riêng — action đã nhúng sẵn trong mỗi `flat_rule_entry_t`.
 
 ---
 
 ### 2.5 Module ACL Engine (`rule/acl_engine`)
 
-**Trách nhiệm:** Build two-stage ACL structure từ các rule đã kiểm tra hợp lệ; cung cấp batch lookup interface được gọi từ Worker lcore; duy trì per-worker hit counter.
+**Trách nhiệm:** Build `flat_acl_ctx` duy nhất từ `flat_rule_table_t` đã được rule_loader xây dựng; cung cấp single-stage batch lookup interface (đọc-chỉ, không trạng thái) cho Worker lcore.
 
-**Đầu vào (giai đoạn build):** Mảng các struct `spi_rule_t`, số lượng, `filter_group_table_t *`.
+**Đầu vào (giai đoạn build):** `const flat_rule_table_t *`, `match_mode_t`.
 
-**Đầu vào (giai đoạn lookup):** Mảng `acl_key_t keys[]`, số lượng `nb`, con trỏ đến kết quả.
+**Đầu vào (giai đoạn lookup — gọi từ Worker):** Mảng `const uint8_t *keys_ptr[]`, số lượng `nb`, mảng kết quả `uint32_t results[]`.
 
-**Đầu ra (giai đoạn lookup):** Mảng `uint32_t group_ids[]` (Stage-1) và `acl_result_t results[]` (Stage-2), được gọi từ worker_lcore_func.
+**Đầu ra (giai đoạn lookup):** `results[i]` = `file_order + 1` của rule khớp có priority cao nhất; `0` nếu không khớp (không xảy ra khi DEFAULT catch-all được thêm đúng cách). Worker tra cứu `flat_rule_table.rules[results[i]-1].action` để lấy action.
 
-**Two-stage build:**
+**Flat single-stage build:**
 
-- `acl_engine_build_stage1(rules[], num_rules)`: Build `stage1_ctx` chứa 1 rule đại diện cho mỗi group (tối đa 4096 rules). Stage-1 context nhỏ gọn, fit trong L1/L2 cache của Worker lcore sau warm-up.
-- `acl_engine_init_stage2()`: Khởi tạo mảng `group_ctx[SPIFAST_MAX_GROUPS]` = NULL. Stage-2 context được build lazy — chỉ build khi group được hit lần đầu.
-- `acl_engine_build_group(group_id, filters[], n)`: Build `group_ctx[group_id]` chứa tối đa `SPIFAST_MAX_FILTERS_PER_GROUP` (2048) filter rules cho group đó. Được gọi từ Main lcore khi group hit lần đầu, không block fast path.
+- `acl_engine_build(flat_rule_table, match_mode)`: Build một `rte_acl_ctx` duy nhất (`flat_acl_ctx`) chứa tất cả rule từ `flat_rule_table`. Priority được gán theo `match_mode` (xem Mục 4.4). Hoàn thành trước khi Worker lcore khởi chạy — không có lazy build.
+- `acl_get_flat_ctx()`: Trả về `flat_acl_ctx` (read-only) để Worker gọi `rte_acl_classify`.
+- `acl_get_flat_rule_table()`: Trả về `flat_rule_table` (read-only) để Worker tra cứu action sau classify.
+- `acl_engine_destroy()`: Giải phóng `flat_acl_ctx`. Gọi từ main lcore sau khi tất cả Worker dừng.
 
-**Xem Mục 4 để biết thiết kế ACL engine đầy đủ bao gồm ACL field definitions, build sequence và batch lookup.**
+**Xem Mục 4 để biết thiết kế ACL engine đầy đủ bao gồm ACL field definitions, priority encoding, build sequence và matching algorithm.**
 
 ---
 
 ### 2.6 Module Worker (`worker/worker`)
 
-**Trách nhiệm:** Thực thi hàm Worker lcore: dequeue burst mbuf từ `worker_ring`; đọc five-tuple metadata từ mbuf headroom; thực hiện batch two-stage ACL classify; áp dụng hành động FORWARD (enqueue `tx_ring`) hoặc DROP (free mbuf).
+**Trách nhiệm:** Thực thi hàm Worker lcore: dequeue burst mbuf từ `worker_ring`; đọc five-tuple metadata từ mbuf headroom; thực hiện single-stage flat ACL classify; tra cứu action từ `flat_rule_table`; áp dụng hành động FORWARD (enqueue `tx_ring`) hoặc DROP (free mbuf).
 
-**Đầu vào:** `rte_ring *worker_ring`, `rte_ring *tx_ring`, `struct rte_acl_ctx *stage1_ctx`, `struct rte_acl_ctx **group_ctx`, con trỏ đến `worker_lcore_stats_t`.
+**Đầu vào:** `rte_ring *worker_ring`, `rte_ring *tx_ring`, `struct rte_acl_ctx *flat_acl_ctx`, `const flat_rule_table_t *flat_rule_table`, con trỏ đến `worker_lcore_stats_t`.
 
 **Đầu ra:** FORWARD mbufs được enqueue vào `tx_ring`. DROP mbufs được giải phóng về mempool. Counter `worker_lcore_stats_t` đã cập nhật.
 
@@ -439,10 +441,12 @@ Phép biến đổi thuần túy, thời gian hằng số, phi trạng thái. Đ
 
 ```
 worker_lcore_func(void *arg):
-  ctx   = (worker_ctx_t *) arg
-  ring  = ctx->worker_ring
-  tx    = ctx->tx_ring
-  stats = &ctx->stats
+  ctx            = (worker_ctx_t *) arg
+  ring           = ctx->ring
+  tx             = ctx->tx_ring
+  flat_acl_ctx   = ctx->flat_acl_ctx
+  flat_rule_tbl  = ctx->flat_rule_table
+  stats          = ctx->stats
 
   trong khi shutdown_flag chưa được đặt HOẶC ring chưa rỗng:
     nb = rte_ring_dequeue_burst(ring, pkts[], WORKER_BURST_SIZE, NULL)
@@ -453,52 +457,43 @@ worker_lcore_func(void *arg):
       meta = (pkt_meta_t *)(rte_pktmbuf_mtod(pkts[i], uint8_t*)
                              - sizeof(pkt_meta_t))
       keys[i].protocol = meta->protocol
-      keys[i].src_ip   = meta->src_ip
-      keys[i].dst_ip   = meta->dst_ip
+      keys[i].src_ip   = rte_be_to_cpu_32(meta->src_ip)   /* NBO → HBO cho ACL */
+      keys[i].dst_ip   = rte_be_to_cpu_32(meta->dst_ip)
       keys[i].src_port = meta->src_port
       keys[i].dst_port = meta->dst_port
 
-    /* Stage-1: Batch ACL classify → xác định group_id */
-    rte_acl_classify(ctx->stage1_ctx, keys_ptr, group_results, nb, 1)
+    /* Flat single-stage ACL classify — toàn bộ burst trong 1 lần gọi */
+    memset(results, 0, nb * sizeof(uint32_t))
+    rte_acl_classify(flat_acl_ctx, keys_ptr, results, nb, 1)
 
-    /* Stage-2: Batch ACL classify theo từng group (gộp batch per group) */
-    với mỗi i trong [0, nb):
-      userdata = group_results[i]
-      nếu userdata == 0:
-        group_id = default_group_id
-      ngược lại:
-        group_id = userdata - 1
-
-      /* Lookup stage2 context của group này */
-      g_ctx = ctx->group_ctx[group_id]
-      nếu g_ctx == NULL:
-        /* Group chưa được build — áp dụng default action tạm thời */
-        action_results[i] = default_action
-        trigger_lazy_build(group_id)   /* báo Main lcore build async */
-      ngược lại:
-        rte_acl_classify(g_ctx, &keys_ptr[i], &filter_result, 1, 1)
-        action_results[i] = filter_group_table.groups[
-                              filter_result ? filter_result - 1 : group_id
-                            ].action
-
-      stats->hit_count[group_id]++
-
-    /* Áp dụng action */
+    /* Per-packet: tra cứu action và dispatch */
     nb_tx = 0
     với mỗi i trong [0, nb):
-      nếu action_results[i] == ACTION_FORWARD:
+      ud = results[i]
+      nếu ud == 0:
+        /* Không rule nào khớp — fallback DROP (không xảy ra nếu DEFAULT tồn tại) */
+        action    = ACTION_DROP
+        group_idx = DEFAULT_GROUP_IDX
+      ngược lại:
+        entry     = &flat_rule_tbl->rules[ud - 1]   /* O(1) lookup */
+        action    = entry->action
+        group_idx = entry->group_idx
+
+      /* Per-group hit counter — không trên mbuf critical path */
+      ctx->group_hits[group_idx]++
+
+      nếu action == ACTION_FORWARD:
         tx_burst[nb_tx++] = pkts[i]
-        stats->fwd_packets++
-        stats->fwd_bytes += pkts[i]->pkt_len
+        stats->forwarded++
       ngược lại:
         rte_pktmbuf_free(pkts[i])
-        stats->drop_packets++
+        stats->dropped++
 
-    /* Enqueue vào tx_ring */
+    /* Enqueue FORWARD batch vào tx_ring */
     nếu nb_tx > 0:
-      nb_enqueued = rte_ring_enqueue_burst(tx, tx_burst, nb_tx, NULL)
-      nếu nb_enqueued < nb_tx:
-        với mỗi i trong [nb_enqueued, nb_tx):
+      nb_sent = rte_ring_enqueue_burst(tx, tx_burst, nb_tx, NULL)
+      nếu nb_sent < nb_tx:
+        với mỗi i trong [nb_sent, nb_tx):
           rte_pktmbuf_free(tx_burst[i])
           stats->tx_ring_drop++
 
@@ -626,12 +621,15 @@ typedef struct {
     uint16_t dst_port_hi;
     proto_match_t protocol;  /* TCP, UDP, hoặc ANY(wildcard)               */
 
-    uint32_t precedence;     /* từ khai báo group; thấp hơn = ưu tiên cao hơn */
-    uint32_t group_id;       /* chỉ số trong filter_group_table            */
+    uint32_t precedence;     /* từ khai báo group; cao hơn = ưu tiên cao hơn */
+    uint32_t group_idx;      /* chỉ số trong flat_rule_table.group_names[]
+                                — gán bởi rule_loader, dùng cho stats       */
 } spi_rule_t;
 ```
 
-### 3.3 Cấu Trúc Filter Group (`filter_group_t` và `filter_group_table_t`)
+### 3.3 Cấu Trúc Flat Rule Table (`flat_rule_entry_t` và `flat_rule_table_t`)
+
+`filter_group_t` và `filter_group_table_t` đã bị loại bỏ khỏi mô hình runtime. Thay thế bằng bảng rule phẳng, trong đó action và group_idx được nhúng trực tiếp vào mỗi entry — không cần tra cứu group riêng biệt.
 
 ```c
 typedef enum {
@@ -639,33 +637,48 @@ typedef enum {
     ACTION_DROP    = 1
 } group_action_t;
 
-typedef struct {
-    char          name[SPIFAST_GROUP_NAME_LEN];
-    group_action_t action;
-    uint32_t      precedence;   /* số nguyên precedence nhỏ nhất trong các rule
-                                   thuộc group này (dùng để tie-breaking)    */
-    uint32_t      group_id;     /* chỉ số trong bảng; cũng dùng làm ACL userdata */
-} filter_group_t;
-
 #define SPIFAST_MAX_GROUPS  4096
 
 typedef struct {
-    filter_group_t groups[SPIFAST_MAX_GROUPS];
-    uint32_t       num_groups;
-} filter_group_table_t;
-```
+    /* Định danh — dùng cho logging và stats */
+    char           rule_name[SPIFAST_RULE_NAME_LEN];
+    char           group_name[SPIFAST_GROUP_NAME_LEN];
+    uint32_t       group_idx;       /* chỉ số vào flat_rule_table.group_names[] */
 
-**Mã hóa ACL userdata:** ACL engine lưu `group_id + 1` làm trường `userdata` trong mỗi mục ACL rule. Kết quả lookup bằng `0` nghĩa là không khớp (hành vi ACL mặc định); khác không nghĩa là `group_id = result - 1`. Cách này tránh nhầm lẫn giữa "không khớp" và group index 0.
+    /* Điều kiện khớp five-tuple */
+    uint32_t       src_ip;
+    uint8_t        src_prefix_len;
+    uint32_t       dst_ip;
+    uint8_t        dst_prefix_len;
+    uint16_t       src_port_lo;
+    uint16_t       src_port_hi;
+    uint16_t       dst_port_lo;
+    uint16_t       dst_port_hi;
+    uint8_t        protocol;        /* IPPROTO_TCP(6), IPPROTO_UDP(17), 0=any */
 
-### 3.4 Cấu Trúc Kết Quả Tra Cứu ACL (`acl_result_t`)
+    /* Action nhúng trực tiếp — không cần tra cứu group table runtime */
+    group_action_t action;          /* ACTION_FORWARD hoặc ACTION_DROP        */
 
-```c
+    /* Metadata thứ tự — dùng bởi acl_engine_build */
+    uint32_t       precedence;      /* từ khai báo group; cao hơn = ưu tiên cao hơn */
+    uint32_t       file_order;      /* chỉ số 0-based theo thứ tự xuất hiện trong file */
+} flat_rule_entry_t;
+
 typedef struct {
-    uint32_t       group_id;   /* chỉ số trong filter_group_table              */
-    group_action_t action;     /* ACTION_FORWARD hoặc ACTION_DROP              */
-    uint32_t       rule_id;    /* chỉ số rule nội bộ ACL để đếm lượt khớp     */
-} acl_result_t;
+    flat_rule_entry_t rules[SPIFAST_MAX_RULES]; /* indexed by file_order        */
+    uint32_t          num_rules;
+
+    /* Bảng tên group — chỉ dùng cho stats/logging, không dùng cho matching */
+    char     group_names[SPIFAST_MAX_GROUPS][SPIFAST_GROUP_NAME_LEN];
+    uint32_t num_groups;
+} flat_rule_table_t;
 ```
+
+**Mã hóa ACL userdata:** `data.userdata = rule.file_order + 1`. Kết quả classify `== 0` nghĩa là không khớp; `!= 0` → `file_order = result - 1` → `flat_rule_table.rules[file_order]` cho action trực tiếp trong O(1).
+
+### 3.4 Cấu Trúc Kết Quả Tra Cứu ACL
+
+> **Đã loại bỏ.** `acl_result_t` không còn cần thiết. Kết quả tra cứu từ `rte_acl_classify` là `uint32_t results[]`; action được lấy trực tiếp bằng `flat_rule_table.rules[results[i]-1].action` — không cần struct trung gian.
 
 ### 3.5 Cấu Trúc Counter Thống Kê Per-lcore
 
@@ -773,25 +786,109 @@ typedef struct {
 
 ## 4. Thiết Kế ACL Rule Engine
 
-### 4.1 Lý Do Thiết Kế — DPDK `rte_acl` Two-Stage
+> **Phiên bản:** 2.0 — Flat Single-Stage ACL (thay thế Two-Stage từ SDD v1.1)
 
-ACL engine được xây dựng trên thư viện `librte_acl` của DPDK theo mô hình two-stage để đáp ứng quy mô 4096 group × 2048 filter/group mà không làm một ACL context đơn khổng lồ không fit cache.
+### 4.1 Lý Do Thiết Kế — Single-Stage Flat ACL
 
-- **Stage-1 context (`stage1_ctx`):** Chứa tối đa 4096 rule đại diện (1 rule/group). Nhỏ gọn, fit trong L1/L2 cache của Worker lcore sau warm-up. Lookup Stage-1 xác định `group_id` cho gói tin.
-- **Stage-2 context (`group_ctx[group_id]`):** Mỗi group có một `rte_acl_ctx` riêng chứa tối đa 2048 filter rules. Được build lazy khi group được hit lần đầu. Fit trong L1 cache khi đang active. Lookup Stage-2 xác định filter cụ thể và action trong group.
+Mô hình two-stage trước đây (stage1_ctx + group_ctx[]) bị loại bỏ hoàn toàn. Mô hình mới sử dụng một `rte_acl_ctx` duy nhất (`flat_acl_ctx`) chứa **tất cả rule từ tất cả group** đã được làm phẳng (flattened) vào một bảng tuyến tính.
 
-Cả hai stage đều sử dụng batch `rte_acl_classify` được gọi từ Worker lcore, không phải từ RX lcore.
+**Thay đổi cốt lõi:**
 
-### 4.2 Định Nghĩa Trường ACL
+| Khái niệm cũ | Trạng thái | Thay thế |
+|---|---|---|
+| `stage1_ctx` | **Loại bỏ** | `flat_acl_ctx` (ACL context duy nhất) |
+| `group_ctx[SPIFAST_MAX_GROUPS]` | **Loại bỏ** | Không tồn tại |
+| `filter_group_table_t` | **Loại bỏ** (runtime) | `flat_rule_table_t` (bảng rule phẳng) |
+| `filter_group_t` | **Loại bỏ** (runtime) | Trường `action` nhúng trực tiếp trong `flat_rule_entry_t` |
+| `acl_result_t` | **Loại bỏ** | `flat_rule_entry_t` tra cứu bằng `file_order` |
+| Lazy build từ Worker → Main | **Loại bỏ** | Không cần; build hoàn tất trước khi lcore khởi chạy |
+| `atomic_store`/`atomic_load` cho `group_ctx[g]` | **Loại bỏ** | Không cần đồng bộ |
+| 2 lần gọi `rte_acl_classify` mỗi burst | **Loại bỏ** | **1 lần gọi** duy nhất |
 
-Bố cục key và `rte_acl_field_def` giống nhau cho cả Stage-1 và Stage-2:
+**Lợi ích của mô hình flat:**
+- Worker critical path đơn giản hơn: 1 ACL call thay vì 2.
+- Không cần lazy build, không race condition giữa Main và Worker lcore.
+- Action (FORWARD/DROP) có sẵn trực tiếp từ kết quả lookup — không cần tra cứu group table.
+- Build time xác định hoàn toàn trước khi pipeline khởi chạy.
+
+**Đánh đổi:** ACL context lớn hơn (chứa tất cả rule thay vì chỉ rule đại diện). Với quy mô thực tế (vài chục đến vài trăm rule), context vẫn fit trong L2 cache.
+
+### 4.2 Cấu Trúc Dữ Liệu Flat ACL
+
+#### 4.2.1 `flat_rule_entry_t` — Mục Rule Phẳng
+
+Mỗi mục biểu diễn một rule đầy đủ với điều kiện khớp và action đã được giải quyết trực tiếp (không cần tra cứu group).
+
+```c
+typedef struct {
+    /* Định danh — dùng cho logging và debug */
+    char           rule_name[SPIFAST_RULE_NAME_LEN];
+    char           group_name[SPIFAST_GROUP_NAME_LEN];
+    uint32_t       group_idx;       /* chỉ số trong flat_rule_table.group_names[]
+                                       — dùng cho stats aggregation, không dùng
+                                       cho matching                              */
+
+    /* Điều kiện khớp five-tuple */
+    uint32_t       src_ip;          /* địa chỉ mạng hoặc host, network byte order */
+    uint8_t        src_prefix_len;  /* CIDR prefix [0-32]; 32 = host chính xác   */
+    uint32_t       dst_ip;
+    uint8_t        dst_prefix_len;
+    uint16_t       src_port_lo;     /* giới hạn dưới range; 0 nếu wildcard       */
+    uint16_t       src_port_hi;     /* giới hạn trên range; 65535 nếu wildcard   */
+    uint16_t       dst_port_lo;
+    uint16_t       dst_port_hi;
+    uint8_t        protocol;        /* IPPROTO_TCP(6), IPPROTO_UDP(17), 0=any    */
+
+    /* Action — nhúng trực tiếp từ group declaration, không cần tra cứu runtime */
+    group_action_t action;          /* ACTION_FORWARD hoặc ACTION_DROP           */
+
+    /* Metadata thứ tự */
+    uint32_t       precedence;      /* từ khai báo group; cao hơn = ưu tiên cao hơn */
+    uint32_t       file_order;      /* chỉ số 0-based theo thứ tự xuất hiện trong
+                                       file rule; dùng làm ACL userdata (file_order+1) */
+} flat_rule_entry_t;
+```
+
+**Ghi chú thiết kế:** `group_idx` và `group_name` được giữ lại chỉ cho mục đích thống kê và logging. Chúng **không** được sử dụng trong hot path matching — chỉ sau khi action đã xác định xong.
+
+#### 4.2.2 `flat_rule_table_t` — Bảng Rule Phẳng
+
+```c
+#define SPIFAST_MAX_FLAT_RULES   SPIFAST_MAX_RULES   /* hằng số hiện có */
+
+typedef struct {
+    flat_rule_entry_t rules[SPIFAST_MAX_FLAT_RULES]; /* indexed by file_order      */
+    uint32_t          num_rules;                      /* tổng số rule (bao gồm DEFAULT) */
+
+    /* Bảng tên group — dùng cho stats reporting, không dùng cho matching */
+    char     group_names[SPIFAST_MAX_GROUPS][SPIFAST_GROUP_NAME_LEN];
+    uint32_t num_groups;
+} flat_rule_table_t;
+```
+
+`rules[]` được lập chỉ mục bởi `file_order`: `rules[file_order]` là rule thứ `file_order` trong file cấu hình. Mảng này không được sort lại sau khi xây dựng — thứ tự file được bảo toàn để đảm bảo `file_order` làm chỉ số truy cập O(1).
+
+#### 4.2.3 Mã Hóa ACL Userdata
 
 ```
-Bố cục Key (13 bytes tổng, được căn chỉnh đến 16 bytes):
+data.userdata = rule.file_order + 1
+```
+
+- `userdata == 0`: không có rule nào khớp (không thể xảy ra nếu DEFAULT catch-all được thêm đúng cách).
+- `userdata == 1..N`: `file_order = userdata - 1` → tra cứu `flat_rule_table.rules[file_order]` để lấy action.
+
+Cách mã hóa này duy trì convention DPDK (`0 = no match`) đồng thời cho phép tra cứu O(1) sau khi classify.
+
+### 4.3 Định Nghĩa Trường ACL
+
+Bố cục key `acl_key_t` và mảng `spifast_acl_fields[]` được giữ nguyên không thay đổi — flat model sử dụng cùng cấu trúc key, chỉ có một context duy nhất thay vì hai:
+
+```
+Bố cục Key (13 bytes tổng, căn chỉnh đến 16 bytes):
 
 Offset  Kích thước  Trường
 ------  ----------  ------
-  0        1        protocol   (IP protocol number: 6=TCP, 17=UDP, 0=wildcard)
+  0        1        protocol   (IP protocol: 6=TCP, 17=UDP, 0=wildcard)
   1        4        src_ip     (IPv4, network byte order)
   5        4        dst_ip     (IPv4, network byte order)
   9        2        src_port   (host byte order)
@@ -801,40 +898,35 @@ Offset  Kích thước  Trường
 
 ```c
 static const struct rte_acl_field_def spifast_acl_fields[] = {
-    /* Trường 0: protocol — byte range */
-    {
+    {   /* protocol — bitmask match */
         .type        = RTE_ACL_FIELD_TYPE_BITMASK,
         .size        = sizeof(uint8_t),
         .field_index = 0,
         .input_index = 0,
         .offset      = offsetof(acl_key_t, protocol),
     },
-    /* Trường 1: source IPv4 — prefix match */
-    {
+    {   /* src_ip — prefix match */
         .type        = RTE_ACL_FIELD_TYPE_MASK,
         .size        = sizeof(uint32_t),
         .field_index = 1,
         .input_index = 1,
         .offset      = offsetof(acl_key_t, src_ip),
     },
-    /* Trường 2: destination IPv4 — prefix match */
-    {
+    {   /* dst_ip — prefix match */
         .type        = RTE_ACL_FIELD_TYPE_MASK,
         .size        = sizeof(uint32_t),
         .field_index = 2,
         .input_index = 2,
         .offset      = offsetof(acl_key_t, dst_ip),
     },
-    /* Trường 3: source port — range match */
-    {
+    {   /* src_port — range match */
         .type        = RTE_ACL_FIELD_TYPE_RANGE,
         .size        = sizeof(uint16_t),
         .field_index = 3,
         .input_index = 3,
         .offset      = offsetof(acl_key_t, src_port),
     },
-    /* Trường 4: destination port — range match */
-    {
+    {   /* dst_port — range match */
         .type        = RTE_ACL_FIELD_TYPE_RANGE,
         .size        = sizeof(uint16_t),
         .field_index = 4,
@@ -844,108 +936,235 @@ static const struct rte_acl_field_def spifast_acl_fields[] = {
 };
 ```
 
-**Mã hóa wildcard:**
-- Protocol wildcard (`any`): mask = 0x00 với value 0x00 (khớp với bất kỳ byte value nào).
-- IP wildcard (`any`): prefix length 0 → khớp với tất cả IP.
-- Port wildcard (`any`): range [0, 65535].
-- Khớp chính xác IP host: prefix length 32.
-- Khớp chính xác port: range [port, port].
+**Mã hóa wildcard** (không thay đổi):
+- Protocol `any`: bitmask value=0x00, mask=0x00 → khớp mọi giá trị byte.
+- IP `any`: prefix length 0 → khớp 0.0.0.0/0.
+- Port `any`: range [0, 65535].
+- IP host chính xác: prefix length 32.
+- Port chính xác: range [port, port].
 
-### 4.3 Trình Tự Build Bảng ACL Two-Stage
+### 4.4 Priority Encoding — Ánh Xạ Sang `rte_acl`
 
-```
-acl_engine_build_stage1(rules[], num_rules, filter_group_table):
-  /* Mỗi group đóng góp đúng 1 rule đại diện vào Stage-1 */
+`rte_acl_classify` với `categories=1` trả về rule có `data.priority` **cao nhất** trong số tất cả rule khớp. SPIFast tận dụng hành vi này để triển khai cả hai chế độ khớp bằng cách điều chỉnh cách gán priority khi build, không cần thay đổi hot path.
 
-  1. ctx = rte_acl_create("spifast_stage1")
-     acl_param.max_rule_num = SPIFAST_MAX_GROUPS   /* tối đa 4096 */
+#### Quy tắc gán priority
 
-  2. Với mỗi group g trong filter_group_table:
-       Lấy rule đại diện của group g (rule có precedence thấp nhất trong group)
-       Điền fields và masks từ rule đó
-       data.userdata = g.group_id + 1
-       data.priority = UINT32_MAX - g.precedence
-       rte_acl_add_rules(ctx, &acl_rule, 1)
-
-  3. rte_acl_build(ctx, &cfg)
-  4. stage1_ctx = ctx
-  5. Trả về 0 khi thành công; -1 khi có lỗi rte_acl.
-
-acl_engine_init_stage2():
-  /* Khởi tạo tất cả group_ctx[] = NULL (lazy build) */
-  memset(group_ctx, 0, sizeof(group_ctx))
-  Khởi tạo per-worker hit_count[] = 0
-
-acl_engine_build_group(group_id, filters[], n_filters):
-  /* Được gọi từ Main lcore khi group được hit lần đầu */
-  1. ctx = rte_acl_create("spifast_group_%u", group_id)
-     acl_param.max_rule_num = SPIFAST_MAX_FILTERS_PER_GROUP   /* 2048 */
-
-  2. Với mỗi filter f trong filters[]:
-       Điền fields và masks từ f
-       data.userdata = f.filter_id + 1
-       data.priority = UINT32_MAX - f.precedence
-       rte_acl_add_rules(ctx, &acl_rule, 1)
-
-  3. Thêm default filter (wildcard, priority thấp nhất)
-  4. rte_acl_build(ctx, &cfg)
-  5. atomic_store(group_ctx[group_id], ctx)   /* Worker đọc ngay sau đó */
-  6. Trả về 0 khi thành công; -1 khi có lỗi rte_acl.
-```
-
-### 4.4 Batch ACL Lookup Trong Worker Lcore
-
-ACL lookup không còn thực hiện theo từng gói tin riêng lẻ trên RX lcore. Thay vào đó, Worker lcore gọi `rte_acl_classify` theo batch cho cả hai stage sau khi dequeue toàn bộ burst:
+**Precedence semantics:** Giá trị `precedence` trong file rule là số nguyên dương, **cao hơn = ưu tiên cao hơn**. Rule DEFAULT được khai báo với precedence thấp nhất (thường là 1).
 
 ```
-/* Stage-1 batch: xác định group_id cho tất cả packet trong burst */
-keys_ptr[nb] = array of (const uint8_t*) trỏ vào keys[]
-rte_acl_classify(stage1_ctx, keys_ptr, group_results, nb, 1)
-/* group_results[i] = group_id + 1, hoặc 0 nếu không khớp → default group */
+Chế độ best-match (--mode best):
+  data.priority = rule.precedence
+  → rule có precedence cao nhất thắng khi nhiều rule khớp
+  → ví dụ: fg_facebook(100) < fg_youtube(101) < fg_http(102) < fg_dns(104)
 
-/* Stage-2: với mỗi packet, lookup group_ctx của group đã xác định */
-nếu group_ctx[group_id] != NULL:
-  rte_acl_classify(group_ctx[group_id], &keys_ptr[i], &filter_result, 1, 1)
-  action = filter_group_table.groups[filter_result ? filter_result-1 : group_id].action
-ngược lại:
-  action = default_action   /* group chưa build, áp dụng default tạm thời */
-  trigger_lazy_build(group_id)
+Chế độ first-match (--mode first):
+  data.priority = num_explicit_rules - rule.file_order
+  → file_order=0 nhận priority=N (cao nhất)
+  → file_order=N-1 nhận priority=1 (thấp nhất nhưng > 0)
+  → rule xuất hiện sớm hơn trong file luôn thắng
+
+DEFAULT rule (cả hai chế độ):
+  data.priority = 0
+  → luôn bị đánh bại bởi bất kỳ explicit rule nào có priority ≥ 1
 ```
 
-Batch classify với n=32 cho phép CPU prefetch và SIMD pipeline che giấu cache miss latency của ACL structure — đặc biệt quan trọng với 64-byte frames có budget per-packet rất nhỏ.
+**Ví dụ với file rule tham chiếu (7 explicit rules + DEFAULT):**
 
-### 4.5 Xử Lý Priority
+| Rule | file_order | precedence | priority (best) | priority (first) |
+|---|---|---|---|---|
+| f_l34_facebook_1 | 0 | 100 | 100 | 7 |
+| f_l34_facebook_4 | 1 | 100 | 100 | 6 |
+| f_l34_youtube_1  | 2 | 101 | 101 | 5 |
+| f_l34_youtube_4  | 3 | 101 | 101 | 4 |
+| f_l34_http_all   | 4 | 102 | 102 | 3 |
+| f_l34_dns_udp    | 5 | 104 | 104 | 2 |
+| f_l34_dns_tcp    | 6 | 104 | 104 | 1 |
+| DEFAULT (catch-all) | 7 | 1 | **0** | **0** |
 
-`rte_acl` chọn rule khớp có giá trị `data.priority` cao nhất khi nhiều rule khớp. SPIFast ánh xạ `precedence` (thấp hơn = ưu tiên cao hơn) sang priority của `rte_acl`:
+*num_explicit_rules = 7; DEFAULT priority = 0 cố định trong cả hai chế độ.*
+
+**Trường hợp packet khớp nhiều rule (ví dụ: TCP dst=31.13.64.1 dport=80):**
+- Best-match: f_l34_http_all (precedence=102) thắng vì 102 > 100.
+- First-match: f_l34_facebook_1 (file_order=0, priority=7) thắng vì 7 > 3.
+
+### 4.5 Trình Tự Build `flat_acl_ctx`
 
 ```
-acl_priority = UINT32_MAX - rule.precedence
+acl_engine_build(flat_rule_table, match_mode):
+
+  Bước 1 — Tạo ACL context
+    ctx = rte_acl_create("spifast_flat")
+    acl_param.max_rule_num = flat_rule_table.num_rules   /* bao gồm DEFAULT */
+    acl_param.rule_size    = RTE_ACL_RULE_SZ(5)          /* 5 trường */
+
+  Bước 2 — Thêm tất cả explicit rule vào context
+    với mỗi entry trong flat_rule_table.rules[0..num_rules-2]:
+      /* Điền các trường khớp */
+      acl_rule.field[0] = {protocol, protocol_mask}
+      acl_rule.field[1] = {src_ip,   src_prefix_mask}
+      acl_rule.field[2] = {dst_ip,   dst_prefix_mask}
+      acl_rule.field[3] = {src_port_lo, src_port_hi}
+      acl_rule.field[4] = {dst_port_lo, dst_port_hi}
+
+      /* Gán userdata và priority theo chế độ */
+      acl_rule.data.userdata = entry.file_order + 1
+
+      nếu match_mode == MATCH_MODE_BEST:
+        acl_rule.data.priority = entry.precedence
+      ngược lại:   /* MATCH_MODE_FIRST */
+        acl_rule.data.priority = (flat_rule_table.num_rules - 1) - entry.file_order
+        /* Đảm bảo priority ≥ 1 cho mọi explicit rule */
+
+      rte_acl_add_rules(ctx, &acl_rule, 1)
+
+  Bước 3 — Thêm DEFAULT catch-all rule
+    acl_rule.field[0] = {0x00, 0x00}      /* protocol = any */
+    acl_rule.field[1] = {0,    0}          /* src_ip = 0.0.0.0/0 */
+    acl_rule.field[2] = {0,    0}          /* dst_ip = 0.0.0.0/0 */
+    acl_rule.field[3] = {0,    65535}      /* src_port = any */
+    acl_rule.field[4] = {0,    65535}      /* dst_port = any */
+    acl_rule.data.userdata = default_entry.file_order + 1
+    acl_rule.data.priority = 0             /* luôn bị đánh bại bởi explicit rules */
+    rte_acl_add_rules(ctx, &acl_rule, 1)
+
+  Bước 4 — Compile
+    rte_acl_build(ctx, &acl_build_cfg)
+    nếu lỗi: rte_acl_free(ctx); return -1
+
+  Bước 5 — Lưu context (read-only sau đây)
+    flat_acl_ctx = ctx
+    return 0
 ```
 
-**Chế độ first-match vs. best-match (FR-016):**
+Toàn bộ build được thực hiện một lần trên main lcore trong bước khởi động, trước khi bất kỳ Worker lcore nào được khởi chạy. Không có lazy build, không có đồng bộ hóa runtime.
 
-- **Chế độ Best-match:** Sử dụng `rte_acl_classify` trực tiếp. Thư viện ACL trả về kết quả khớp priority cao nhất theo thiết kế.
-- **Chế độ First-match:** Sắp xếp các rule theo `precedence` tăng dần trước khi gọi `rte_acl_add_rules`, gán priority tăng dần nghiêm ngặt để xấp xỉ first-match semantics.
+### 4.6 Luồng Khớp Trong Worker Lcore
 
-Chế độ khớp được chọn khi khởi động qua `--mode` và không thay đổi trong runtime.
-
-### 4.6 Xử Lý Rule Mặc Định
-
-Rule loader kiểm tra rằng rule DEFAULT group tồn tại (FR-017). Default rule được thêm vào Stage-1 context với `precedence` cao nhất và key toàn wildcard:
+Sau khi dequeue burst và build `acl_key_t[]` từ mbuf headroom (không thay đổi so với trước):
 
 ```
-protocol = ANY (mask 0x00)
-src_ip   = 0.0.0.0/0
-dst_ip   = 0.0.0.0/0
-src_port = [0, 65535]
-dst_port = [0, 65535]
+/* ── Flat single-stage ACL classify — toàn bộ burst trong 1 lần gọi ─────── */
+
+memset(results, 0, nb * sizeof(uint32_t))
+rte_acl_classify(flat_acl_ctx, keys_ptr, results, nb, 1)
+
+/* ── Per-packet dispatch ─────────────────────────────────────────────────── */
+
+nb_tx = 0
+với mỗi i trong [0, nb):
+    ud = results[i]
+
+    nếu ud == 0:
+        /* Không rule nào khớp — lỗi hệ thống nếu DEFAULT được thêm đúng cách.
+         * Fallback an toàn: DROP và đếm vào DEFAULT group. */
+        action    = ACTION_DROP
+        group_idx = DEFAULT_GROUP_IDX
+
+    ngược lại:
+        /* Tra cứu O(1): ud - 1 = file_order = chỉ số trong flat_rule_table */
+        entry     = &flat_rule_table.rules[ud - 1]
+        action    = entry.action        /* ACTION_FORWARD hoặc ACTION_DROP */
+        group_idx = entry.group_idx     /* cho stats */
+
+    /* Cập nhật per-group hit counter (không trên critical path của mbuf) */
+    nếu group_idx < SPIFAST_MAX_GROUPS:
+        worker_ctx.group_hits[group_idx]++
+
+    /* Dispatch mbuf */
+    nếu action == ACTION_FORWARD:
+        tx_burst[nb_tx++] = pkts[i]
+        stats.forwarded++
+    ngược lại:
+        rte_pktmbuf_free(pkts[i])
+        stats.dropped++
+
+/* ── Enqueue FORWARD batch vào tx_ring ───────────────────────────────────── */
+nếu nb_tx > 0:
+    nb_sent = rte_ring_enqueue_burst(tx_ring, tx_burst, nb_tx, NULL)
+    nếu nb_sent < nb_tx:
+        với mỗi i trong [nb_sent, nb_tx):
+            rte_pktmbuf_free(tx_burst[i])
+            stats.tx_ring_drop++
 ```
 
-Điều này đảm bảo mọi gói tin đến Stage-1 lookup đều trả về `userdata` khác không, bảo đảm FR-023.
+Không có lần gọi `rte_acl_classify` thứ hai. Không kiểm tra NULL cho context. Không trigger lazy build. Không cần đồng bộ hóa con trỏ giữa Main và Worker.
 
-### 4.7 Đếm Lượt Khớp Rule
+### 4.7 Sơ Đồ Luồng Runtime
 
-Hit counter được duy trì per-worker trong `worker_lcore_stats_t.hit_count[group_id]`. Mỗi Worker lcore chỉ ghi vào array của chính nó — không có tranh chấp, không cần atomic operation. Stats module aggregate tất cả per-worker `hit_count[]` arrays theo chu kỳ 1 giây từ Main lcore.
+```
+packet → worker_ring
+         │
+         ▼
+  rte_ring_dequeue_burst(worker_ring, pkts[], WORKER_BURST_SIZE)
+         │
+         ▼
+  đọc pkt_meta_t từ mbuf headroom → build acl_key_t[]
+         │
+         ▼
+  rte_acl_classify(flat_acl_ctx, keys_ptr, results, nb, 1)
+         │
+         ├── results[i] == 0
+         │     → ACTION_DROP (lỗi hệ thống, DEFAULT không được thêm)
+         │
+         ├── rules[results[i]-1].action == ACTION_DROP
+         │     → rte_pktmbuf_free(pkts[i])
+         │     → stats.dropped++
+         │
+         └── rules[results[i]-1].action == ACTION_FORWARD
+               → tx_burst[nb_tx++] = pkts[i]
+               → stats.forwarded++
+                    │
+                    ▼
+             rte_ring_enqueue_burst(tx_ring, tx_burst, nb_tx)
+```
+
+### 4.8 Hành Vi Khi Nhiều Rule Khớp
+
+`rte_acl_classify` với `categories=1` trả về đúng 1 kết quả mỗi packet — rule có `data.priority` cao nhất. Đây là hành vi xác định, không ambiguous:
+
+| Tình huống | Best-match | First-match |
+|---|---|---|
+| Đúng 1 rule tường minh khớp | Trả về rule đó | Trả về rule đó |
+| N > 1 rule tường minh khớp | Rule có `precedence` cao nhất thắng (số cao hơn thắng) | Rule có `file_order` thấp nhất thắng (xuất hiện trước thắng) |
+| Chỉ DEFAULT khớp | DEFAULT action (DROP) | DEFAULT action (DROP) |
+| Không rule nào khớp (lỗi) | ACTION_DROP (fallback) | ACTION_DROP (fallback) |
+
+**Tính quyết định:** Với cùng một file rule và cùng `--mode`, mọi packet luôn nhận cùng một action — không phụ thuộc vào thứ tự xử lý, số lượng Worker, hay thứ tự build.
+
+### 4.9 Xử Lý Rule DEFAULT
+
+Rule DEFAULT (`[group: DEFAULT] action=DROP`) được rule_loader kiểm tra là bắt buộc (FR-017). Nó được thêm vào `flat_rule_table` như một entry bình thường với:
+- Điều kiện khớp: toàn wildcard (protocol=any, src_ip=0/0, dst_ip=0/0, port=[0,65535]).
+- `action = ACTION_DROP` (theo khai báo group).
+- `data.priority = 0` — cứng, không phụ thuộc `match_mode`.
+
+Việc thêm DEFAULT vào flat context đảm bảo `results[i]` luôn khác 0 cho mọi gói tin IPv4 hợp lệ, bảo đảm FR-023.
+
+### 4.10 Đếm Lượt Khớp — Per-Group Hit Counter
+
+`worker_ctx_t.group_hits[SPIFAST_MAX_GROUPS]` được giữ nguyên từ thiết kế cũ, nhưng cơ chế cập nhật đơn giản hơn: sau khi `rte_acl_classify` trả về kết quả, `group_idx = flat_rule_table.rules[ud-1].group_idx` được sử dụng trực tiếp để tăng counter. Không cần thêm bước lookup group table.
+
+Stats module aggregate tất cả per-worker `group_hits[]` arrays mỗi chu kỳ 1 giây theo cơ chế không thay đổi (xem Mục 8).
+
+### 4.11 Public API của `acl_engine`
+
+```c
+/* Build flat_acl_ctx từ flat_rule_table.
+ * Phải gọi sau rule_loader_load() và trước khi khởi chạy bất kỳ Worker lcore nào.
+ * match_mode xác định cách gán data.priority cho first-match vs. best-match.
+ * Trả về 0 khi thành công, -1 khi lỗi (rte_acl build fail). */
+int acl_engine_build(const flat_rule_table_t *tbl, match_mode_t match_mode);
+
+/* Trả về con trỏ flat_acl_ctx (read-only) để Worker lcore gọi rte_acl_classify.
+ * Hợp lệ chỉ sau khi acl_engine_build() trả về 0. */
+struct rte_acl_ctx *acl_get_flat_ctx(void);
+
+/* Trả về con trỏ flat_rule_table (read-only) để Worker lcore tra cứu action.
+ * Hợp lệ chỉ sau khi acl_engine_build() trả về 0. */
+const flat_rule_table_t *acl_get_flat_rule_table(void);
+
+/* Giải phóng flat_acl_ctx. Gọi từ main lcore sau khi tất cả Worker đã dừng. */
+void acl_engine_destroy(void); 
 
 ---
 
@@ -973,7 +1192,7 @@ File rule là file văn bản thuần mã hóa UTF-8. Parser xử lý từng dò
 Ví dụ:
 ```
 [group: fg_l34_facebook]     precedence=100  action=FORWARD
-[group: DEFAULT]             precedence=999  action=DROP
+[group: DEFAULT]             precedence=1  action=DROP
 ```
 
 Các trường được phân tách bằng khoảng trắng tùy ý. Tên group là chữ-số với dấu gạch dưới (regex: `[a-zA-Z0-9_]+`). Độ dài tối đa: 63 ký tự.
@@ -1006,7 +1225,7 @@ Các trường được phân tách bằng khoảng trắng tùy ý. Tên group 
 [group: fg_l34_youtube]      precedence=101  action=FORWARD
 [group: fg_l34_http_sdf1003] precedence=102  action=FORWARD
 [group: fg_l34_dns_sdf1005]  precedence=104  action=FORWARD
-[group: DEFAULT]             precedence=999  action=DROP
+[group: DEFAULT]             precedence=1  action=DROP
 
 # Định Nghĩa Rule
 f_l34_facebook_1, fg_l34_facebook,      any, dst_prefix=31.13.64.0/18,  any, any
@@ -1021,48 +1240,51 @@ f_l34_dns_tcp,    fg_l34_dns_sdf1005,   tcp, any,                        53, any
 ### 5.2 Trình Tự Nạp Khi Khởi Động
 
 ```
-rule_loader_load(path, config, group_table, rules[], &num_rules):
+rule_loader_load(path, match_mode, flat_rule_table *out):
 
   Bước 1 — Mở file
     fp = fopen(path, "r")
     nếu fp == NULL:  LOG_ERROR("Cannot open rule file: %s", path); return -1
 
   Bước 2 — Phân tích từng dòng
-    line_no = 0
+    line_no    = 0
+    file_order = 0   /* gán tăng dần cho mỗi rule entry */
+
     với mỗi dòng trong file:
       line_no++
       xóa khoảng trắng đầu/cuối
       nếu dòng trống hoặc bắt đầu bằng '#':  tiếp tục
 
       nếu dòng bắt đầu bằng '[group:':
-        parse_group_declaration(line, line_no, group_table)
+        parse_group_declaration(line, line_no, out)
         /* Kiểm tra: độ dài tên, tính duy nhất, phạm vi precedence [1..999],
            action là FORWARD hoặc DROP */
+        /* Gán out->group_names[out->num_groups] và tăng num_groups */
         khi lỗi: LOG_ERROR(line_no, reason); fclose(fp); return -1
 
       ngược lại:
-        parse_rule_entry(line, line_no, rules[], group_table)
+        /* Điền flat_rule_entry_t, nhúng action từ group declaration đã parse */
+        parse_rule_entry(line, line_no, out, file_order)
         /* Kiểm tra các trường theo Mục 5.3 */
+        /* Gán entry.action = group.action; entry.file_order = file_order++ */
         khi lỗi: LOG_ERROR(line_no, reason); fclose(fp); return -1
 
-      nếu num_groups > SPIFAST_MAX_GROUPS (4096):
+      nếu out->num_groups > SPIFAST_MAX_GROUPS (4096):
         LOG_ERROR("Group count exceeds maximum (4096)"); return -1
 
-      nếu filter_count_in_group > SPIFAST_MAX_FILTERS_PER_GROUP (2048):
-        LOG_ERROR("Filter count in group exceeds maximum (2048)"); return -1
-
   Bước 3 — Kiểm tra sau khi phân tích
-    kiểm tra: num_rules >= 1
-    kiểm tra: DEFAULT group tồn tại (group có precedence cao nhất)
+    kiểm tra: out->num_rules >= 1
+    kiểm tra: DEFAULT group tồn tại (group có action=DROP và wildcard conditions)
     kiểm tra: không có tên rule trùng lặp
     khi có bất kỳ lỗi nào: return -1
 
-  Bước 4 — Build bảng ACL
-    rc = acl_engine_build(rules[], num_rules, group_table)
+  Bước 4 — Build flat ACL context
+    rc = acl_engine_build(out, match_mode)
+    /* acl_engine_build thêm DEFAULT catch-all với priority=0 */
     nếu rc != 0:  return -1
 
   Bước 5 — Ghi log các rule đã nạp
-    log_startup_rules(group_table, rules[], num_rules)
+    log_startup_rules(out)
 
   return 0
 ```
@@ -1081,8 +1303,8 @@ rule_loader_load(path, config, group_table, rules[], &num_rules):
 | Port range (lo-hi) | Cả hai số nguyên trong [0, 65535]; lo ≤ hi |
 | Precedence | Số nguyên trong [1, 999] |
 | Action | Không phân biệt hoa thường: `FORWARD` hoặc `DROP` |
-| Số lượng filter-group | Tổng số group ≤ 4096 |
-| Số lượng filter mỗi group | Số filter trong một group ≤ 2048 |
+| Số lượng group | Tổng số group ≤ 4096 (`SPIFAST_MAX_GROUPS`) |
+| Tổng số rule | Tổng số rule (tất cả group) ≤ `SPIFAST_MAX_RULES` |
 
 ---
 
@@ -1147,14 +1369,15 @@ Mỗi Worker lcore thực thi `worker_lcore_func` thực hiện:
 
 1. Dequeue burst từ `worker_ring[i]` (ring chuyên biệt của mình).
 2. Đọc `pkt_meta_t` từ mbuf headroom của từng mbuf.
-3. Build `keys[]` từ five-tuple metadata.
-4. Batch Stage-1 ACL classify: `rte_acl_classify(stage1_ctx, ...)` → `group_ids[]`.
-5. Per-packet Stage-2 ACL classify: `rte_acl_classify(group_ctx[group_id], ...)` → action.
-6. FORWARD → `rte_ring_enqueue(tx_ring, mbuf)`.
-7. DROP → `rte_pktmbuf_free(mbuf)`.
-8. Cập nhật `worker_lcore_stats[i]` (fwd, drop, hit_count).
+3. Build `keys[]` từ five-tuple metadata (NBO → HBO cho IP trước khi đưa vào ACL).
+4. **Single-stage flat ACL classify:** `rte_acl_classify(flat_acl_ctx, keys_ptr, results, nb, 1)` → `results[]`.
+5. Per-packet: tra cứu O(1) `flat_rule_table.rules[results[i]-1]` → `action`, `group_idx`.
+6. Tăng `group_hits[group_idx]`.
+7. FORWARD → `rte_ring_enqueue_burst(tx_ring, tx_burst, nb_tx)`.
+8. DROP → `rte_pktmbuf_free(mbuf)`.
+9. Cập nhật `worker_lcore_stats[i]` (forwarded, dropped, tx_ring_drop).
 
-Worker không bao giờ gọi `rte_eth_tx_burst()` trực tiếp.
+Worker không bao giờ gọi `rte_eth_tx_burst()` trực tiếp. Không có gọi ACL thứ hai, không kiểm tra NULL context, không trigger lazy build.
 
 ### 6.5 Trách Nhiệm TX lcore
 
@@ -1226,9 +1449,8 @@ Không có thời điểm nào một mbuf được chia sẻ giữa hai lcore đ
 | `worker_rings[i]` | Parser lcore (SP) | Worker lcore i (SC) | SPSC ring: lock-free theo thiết kế |
 | `tx_ring` | Worker lcore × N (MP) | TX lcore (SC) | MPSC ring: `RING_F_MP_ENQ` — CAS lock-free |
 | `shutdown_flag` | RX lcore (người ghi) | Parser, Worker, TX (người đọc) | `volatile int`; single writer; platform memory model đủ |
-| `stage1_ctx` | rule_loader (build, một lần) | Worker lcore × N (read-only) | Không cần đồng bộ sau khi `rte_acl_build` hoàn tất trước khi lcore khởi chạy |
-| `group_ctx[g]` | Main lcore (lazy build) | Worker lcore × N (read) | `atomic_store` / `atomic_load`; Worker đọc NULL → dùng default; Main ghi ctx mới |
-| `filter_group_table` | rule_loader (init, một lần) | Worker lcore (read-only) | Không cần đồng bộ; được build trước khi lcore khởi chạy |
+| `flat_acl_ctx` | rule_loader / acl_engine (build một lần, trước khi lcore khởi chạy) | Worker lcore × N (read-only) | Không cần đồng bộ; `rte_acl_build` hoàn tất trước khi Worker bắt đầu |
+| `flat_rule_table` | rule_loader (init một lần, trước khi lcore khởi chạy) | Worker lcore × N (read-only) | Không cần đồng bộ; bất biến sau khi khởi tạo xong |
 
 ### 6.9 Xem Xét Thứ Tự Gói Tin
 
@@ -1298,21 +1520,24 @@ Hugepage memory (được EAL cấp phát khi khởi động)
 ├── rte_mempool (8192 mbufs × 2176 bytes ≈ 17 MB)
 │    └── cache per-lcore (256 entry mỗi cái)
 │
-├── parser_ring  (1024 × 8 bytes = 8 KB, SPSC)
+├── parser_ring     (1024 × 8 bytes = 8 KB, SPSC)
 ├── worker_ring[0]  (1024 × 8 bytes = 8 KB, SPSC)
 ├── worker_ring[1]  ...
 ├── worker_ring[N-1]
-├── tx_ring      (4096 × 8 bytes = 32 KB, MPSC)
+├── tx_ring         (4096 × 8 bytes = 32 KB, MPSC)
 │
-├── stage1_ctx   (rte_acl context, tối đa 4096 group rules, ~vài MB)
-│
-└── group_ctx[0..4095]  (lazy built, mỗi ctx ≤ 2048 filter rules, ~10-20 KB)
-     ├── group_ctx[0]   → built khi group 0 được hit lần đầu
-     ├── group_ctx[1]   → NULL (chưa build)
-     └── ...
+└── flat_acl_ctx    (rte_acl context duy nhất chứa tất cả rule, ~vài MB)
 ```
 
-Tất cả cấu trúc được DPDK quản lý đều nằm trong hugepage memory. `group_ctx[]` lazy build từ hugepage thông qua `rte_acl_create` trên Main lcore.
+```
+Stack / BSS (không phải hugepage)
+│
+└── flat_rule_table  (flat_rule_entry_t[SPIFAST_MAX_RULES] + group_names[])
+     — kích thước tĩnh, cấp phát tại compile time
+     — read-only sau khi rule_loader hoàn tất
+```
+
+Tất cả cấu trúc DPDK (mempool, ring, acl_ctx) đều nằm trong hugepage memory. `flat_rule_table` là cấu trúc C tĩnh không yêu cầu hugepage. Không có lazy allocation trong runtime — toàn bộ ACL được biên dịch một lần tại khởi động.
 
 ### 7.5 Tham Số Tài Nguyên Có Thể Cấu Hình
 
@@ -1332,7 +1557,8 @@ Các hằng số compile-time sau được định nghĩa trong `src/dpdk/dpdk_i
 #define SPIFAST_EOI_THRESHOLD             100
 #define SPIFAST_PREFETCH_AHEAD            4
 #define SPIFAST_MAX_GROUPS                4096
-#define SPIFAST_MAX_FILTERS_PER_GROUP     2048
+#define SPIFAST_MAX_RULES                 65536  /* tổng rule tối đa trong flat_rule_table */
+/* SPIFAST_MAX_FILTERS_PER_GROUP đã bị loại bỏ cùng với two-stage ACL model */
 ```
 
 ---
@@ -1613,7 +1839,7 @@ Tất cả điều kiện lỗi thuộc hai loại:
 | Lỗi cú pháp rule | `rule_loader_load` (parser dòng) | Ghi log lỗi kèm đường dẫn file, số dòng và nội dung bị lỗi; `return -1` |
 | Tên rule trùng lặp | `rule_loader_load` | Ghi log lỗi xác định cả hai lần xuất hiện; `return -1` |
 | Số lượng group > 4096 | `rule_loader_load` | Ghi log lỗi kèm số lượng; `return -1` |
-| Số lượng filter trong group > 2048 | `rule_loader_load` | Ghi log lỗi kèm tên group và số lượng; `return -1` |
+| Tổng số rule > `SPIFAST_MAX_RULES` | `rule_loader_load` | Ghi log lỗi kèm tổng số rule; `return -1` |
 | Thiếu rule DEFAULT | `rule_loader_load` (kiểm tra sau phân tích) | Ghi log lỗi; `return -1` |
 | Định dạng IP/prefix không hợp lệ | `rule_loader_load` (validator trường) | Ghi log lỗi kèm giá trị trường và số dòng; `return -1` |
 | Port range lo > hi | `rule_loader_load` | Ghi log lỗi; `return -1` |
@@ -1638,8 +1864,7 @@ Tất cả điều kiện lỗi thuộc hai loại:
 | worker_ring đầy (`rte_ring_enqueue` trả về -ENOBUFS) | `parser` (hash dispatch) | Giải phóng mbuf ngay lập tức | `worker_ring_drop` |
 | tx_ring đầy (`rte_ring_enqueue_burst` thiếu slot) | `worker` (enqueue tx_ring) | Giải phóng mbuf ngay lập tức | `tx_ring_drop` |
 | TX queue đầy (`rte_eth_tx_burst` gửi ít hơn nb) | `tx` (tx_burst) | Giải phóng mbuf chưa gửi | `tx_drop_packets` |
-| ACL không khớp Stage-1 | `acl_engine` (trong worker) | Áp dụng hành động DEFAULT group | `hit_count[default_group]` |
-| Stage-2 ctx chưa build (NULL) | `worker` (group_ctx lookup) | Áp dụng default action tạm thời; trigger lazy build | `hit_count[default_group]` |
+| Flat ACL không khớp explicit rule nào (results[i]==0) | `worker` (sau rte_acl_classify) | Áp dụng ACTION_DROP; tăng group_hits[DEFAULT_GROUP_IDX] | `group_hits[DEFAULT_GROUP_IDX]` |
 
 Không có điều kiện lỗi nào trên data path dẫn đến ghi log, `fprintf`, hoặc bất kỳ system call nào. Tất cả đường lỗi kết thúc bằng `rte_pktmbuf_free` và tăng counter.
 
@@ -1655,7 +1880,7 @@ Ví dụ:
 ```
 [SPIFAST ERROR] rule_loader: line 15: invalid CIDR prefix length '33' in field dst_prefix (must be 0-32).
 [SPIFAST ERROR] rule_loader: duplicate rule name 'f_l34_facebook_1' at line 22 (first defined at line 8).
-[SPIFAST ERROR] rule_loader: no DEFAULT group defined. Add '[group: DEFAULT] precedence=999 action=DROP'.
+[SPIFAST ERROR] rule_loader: no DEFAULT group defined. Add '[group: DEFAULT] precedence=1 action=DROP'.
 ```
 
 ---
@@ -1694,24 +1919,24 @@ Trình tự build được khuyến nghị tiến hành theo từng giai đoạn
 14. Kiểm tra với TP-04 (PCAP hai chiều): cùng five-tuple từ cả hai chiều.
 15. Kiểm tra với TP-05 (PCAP VLAN): VLAN parsing và headroom metadata đúng.
 
-### Giai đoạn 4 — Rule Loader và Two-Stage ACL Engine
+### Giai đoạn 4 — Rule Loader và Flat ACL Engine
 
-**Mục tiêu:** Nạp rule và build two-stage ACL structure.
+**Mục tiêu:** Nạp rule, xây dựng `flat_rule_table_t` và build `flat_acl_ctx`.
 
-16. Triển khai `rule/rule_loader.c`: parser file, validator (≤4096 group, ≤2048 filter/group), builder bảng group.
-17. Unit test rule loader: kiểm tra tất cả trường hợp kiểm tra hợp lệ bao gồm giới hạn group và filter.
-18. Triển khai `rule/acl_engine.c`: `acl_engine_build_stage1`, `acl_engine_init_stage2`, `acl_engine_build_group` (lazy).
-19. Unit test ACL engine: stage1 classify đúng group_id; stage2 classify đúng action.
+16. Triển khai `rule/rule_loader.c`: parser file, validator (≤4096 group, tổng rule ≤ `SPIFAST_MAX_RULES`); điền `flat_rule_entry_t` với action và group_idx nhúng trực tiếp; gán `file_order` tăng dần.
+17. Unit test rule loader: kiểm tra tất cả trường hợp hợp lệ, invalid IP, port range, thiếu DEFAULT, tên trùng; kiểm tra `flat_rule_table` output đúng `file_order`, `action`, `group_idx`.
+18. Triển khai `rule/acl_engine.c`: `acl_engine_build(flat_rule_table, match_mode)` — gán `data.priority` theo mode (best: `precedence`; first: `N - file_order`); DEFAULT rule với `priority=0`; `rte_acl_build` một lần.
+19. Unit test ACL engine: verify `rte_acl_classify` trả về `file_order+1` cho các packet khớp; verify priority ordering đúng cho cả `--mode best` và `--mode first`; verify DEFAULT catch-all hoạt động.
 
-### Giai đoạn 5 — Worker lcore với Batch Two-Stage ACL
+### Giai đoạn 5 — Worker lcore với Single-Stage Flat ACL
 
-**Mục tiêu:** Hoàn thành pipeline Worker với batch ACL classify và tx_ring enqueue.
+**Mục tiêu:** Hoàn thành pipeline Worker với single-stage ACL classify và tx_ring enqueue.
 
-20. Triển khai `worker/worker.c` với `worker_lcore_func`: dequeue, đọc headroom, batch Stage-1 classify, per-packet Stage-2 classify, FORWARD → `tx_ring`, DROP → free.
+20. Triển khai `worker/worker.c` với `worker_lcore_func`: dequeue, đọc headroom, **một lần** `rte_acl_classify(flat_acl_ctx, ...)`, tra cứu O(1) `flat_rule_table.rules[ud-1].action`, FORWARD → `tx_ring`, DROP → free, tăng `group_hits[group_idx]`.
 21. Triển khai stub TX lcore: chỉ dequeue từ `tx_ring` rồi free mbuf ngay; đếm counter.
 22. Khởi chạy toàn bộ pipeline: RX → Parser → Worker → TX (stub).
-23. Kiểm tra: tổng `worker_stats[i].fwd_packets` khớp số FORWARD packet dự kiến. Không có mbuf leak.
-24. Kiểm tra với PCAP tham chiếu: mọi gói tin được phân loại vào group mong đợi (RC-004).
+23. Kiểm tra: tổng `worker_stats[i].forwarded` khớp số FORWARD packet dự kiến. Không có mbuf leak.
+24. Kiểm tra với PCAP tham chiếu: mọi gói tin được phân loại đúng action theo rule file (RC-004). Kiểm tra `GROUP_HITS` khớp phân phối lưu lượng.
 
 ### Giai đoạn 6 — TX lcore
 
@@ -1747,7 +1972,7 @@ Trình tự build được khuyến nghị tiến hành theo từng giai đoạn
 
 **Mục tiêu:** Làm cứng ứng dụng trước tất cả điều kiện lỗi.
 
-40. Kiểm thử từng đường lỗi khởi động: file thiếu, cú pháp sai, >4096 group, >2048 filter/group, không có DEFAULT, IP sai, port range sai. Xác nhận thông báo lỗi đúng format.
+40. Kiểm thử từng đường lỗi khởi động: file thiếu, cú pháp sai, >4096 group, tổng rule > `SPIFAST_MAX_RULES`, không có DEFAULT, IP sai, port range sai. Xác nhận thông báo lỗi đúng format.
 41. Kiểm thử lỗi đường dẫn file log: xác nhận cảnh báo trên stderr; xử lý tiếp tục.
 42. Kiểm thử ring overflow bằng cách giảm ring size để kích hoạt `p_ring_drop` và `w_ring_drop`.
 43. Kiểm thử với PCAP chứa frame không phải IPv4: xác nhận `invalid_packets` tăng; không crash.

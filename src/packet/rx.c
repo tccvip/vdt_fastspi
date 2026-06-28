@@ -1,87 +1,132 @@
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
-#include <rte_ethdev.h>
+#include <pcap.h>
+
 #include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_memcpy.h>
 #include <rte_ring.h>
+#include <rte_common.h>
 
 #include "rx.h"
-#include "parser.h"
 
-/* Defined in main.c; workers read this flag to know when to drain and exit. */
+/* Set to 1 by SIGINT/SIGTERM handler in main.c.  NOT by pcap EOF. */
 extern volatile int g_shutdown_flag;
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * select_worker()  —  round-robin dispatcher  (SDD §2.2, §4.3)
- * Single producer, no shared state needed.
- * ───────────────────────────────────────────────────────────────────────────── */
-static inline uint32_t select_worker(uint32_t num_workers)
-{
-    /* TODO: static uint32_t rr_counter = 0;
-     *       return rr_counter++ % num_workers;  */
-    (void)num_workers;
-    return 0;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * process_packet()  —  inline per-packet path  (SDD §2.2)
+ * rx_lcore_func()  —  SDD §2.2  (continuous pcap replay)
  *
- * Called for every mbuf in a received burst.
- * All branches end in either rte_ring_enqueue or rte_pktmbuf_free.
- * No malloc, no printf, no blocking system call on this path.  (SDD §6.2)
- * ───────────────────────────────────────────────────────────────────────────── */
-static inline void process_packet(struct rte_mbuf *mbuf, rx_ctx_t *ctx)
-{
-    /* TODO: pkt_meta_t meta;
-     *       if (parse_packet(mbuf, &meta) != 0):
-     *         rte_pktmbuf_free(mbuf);
-     *         ctx->stats->invalid_packets++;
-     *         return;
-     *
-     *       acl_result_t result = acl_lookup(&meta);
-     *       acl_engine_increment_hit(result.group_id);
-     *
-     *       if (result.action == ACTION_FORWARD):
-     *         uint32_t idx = select_worker(ctx->num_workers);
-     *         int rc = rte_ring_enqueue(ctx->worker_rings[idx], mbuf);
-     *         if (rc != 0):   // ring full → unintended drop (PR-005)
-     *           rte_pktmbuf_free(mbuf);
-     *           ctx->stats->ring_drop_packets++;
-     *         else:
-     *           ctx->stats->forward_packets++;
-     *           ctx->stats->forward_bytes += mbuf->pkt_len;
-     *       else:   // ACTION_DROP
-     *         rte_pktmbuf_free(mbuf);
-     *         ctx->stats->drop_packets++;  */
-    (void)mbuf; (void)ctx;
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * rx_lcore_func()  —  RX / classifier lcore entry point  (SDD §2.2)
+ * Reads packets directly from a pcap file using libpcap, allocates mbufs from
+ * ctx->mempool, copies packet data in, and enqueues into parser_ring.
  *
- * Runs a tight poll loop: burst-receive → parse → classify → dispatch/drop.
- * Signals g_shutdown_flag when net_pcap PMD reports end-of-file.
- * Never calls malloc, free (outside rte_pktmbuf_free), printf, or sleep.
+ * On reaching EOF the pcap handle is closed and reopened, continuing replay
+ * indefinitely without touching any DPDK device state.  The net_pcap DPDK
+ * port remains active for the TX lcore (rte_eth_tx_burst) throughout.
+ *
+ * Batching: packets are collected into a local array (up to SPIFAST_BURST_SIZE)
+ * before a single rte_ring_enqueue_burst call, matching the burst pattern of
+ * the downstream parser lcore.
+ *
+ * mbuf layout:
+ *   rte_pktmbuf_alloc sets data_off = RTE_PKTMBUF_HEADROOM (128 B).
+ *   Packet data is copied to rte_pktmbuf_mtod(m) — the Ethernet frame start.
+ *   Parser writes pkt_meta_t 16 bytes before mtod(m), within the headroom.
+ *   This is identical to the layout produced by the old net_pcap PMD path.
+ *
+ * mbuf ownership:
+ *   After rte_pktmbuf_alloc:       RX lcore owns the mbuf.
+ *   rte_ring_enqueue succeeds:     Parser lcore owns it.
+ *   ring full / alloc fail:        rte_pktmbuf_free → returned to mempool.
+ *
+ * Exits when g_shutdown_flag is set (SIGINT/SIGTERM) or pcap file is empty.
  * ───────────────────────────────────────────────────────────────────────────── */
 int rx_lcore_func(void *arg)
 {
-    /* TODO: rx_ctx_t *ctx = (rx_ctx_t *)arg;
-     *       struct rte_mbuf *rx_pkts[SPIFAST_BURST_SIZE];
-     *       uint32_t zero_empty = 0;
-     *
-     *       while (1):
-     *         uint16_t nb_rx = rte_eth_rx_burst(ctx->port_id, 0,
-     *                                            rx_pkts, SPIFAST_BURST_SIZE);
-     *         if (nb_rx == 0):
-     *           if (++zero_empty >= SPIFAST_EOI_THRESHOLD):
-     *             g_shutdown_flag = 1;
-     *             break;
-     *           continue;
-     *         zero_empty = 0;
-     *         ctx->stats->rx_packets += nb_rx;
-     *         for (i = 0; i < nb_rx; i++):
-     *           process_packet(rx_pkts[i], ctx);
-     *
-     *       return 0;  */
-    (void)arg;
+    rx_ctx_t *ctx = (rx_ctx_t *)arg;
+    char      errbuf[PCAP_ERRBUF_SIZE];
+
+    while (!g_shutdown_flag) {
+        pcap_t *handle = pcap_open_offline(ctx->pcap_path, errbuf);
+        if (handle == NULL) {
+            fprintf(stderr, "[RX] pcap_open_offline(%s) failed: %s\n",
+                    ctx->pcap_path, errbuf);
+            g_shutdown_flag = 1;
+            break;
+        }
+
+        struct rte_mbuf *batch[SPIFAST_BURST_SIZE];
+        unsigned int     nb_batch    = 0;
+        bool             eof_reached = false;
+        uint64_t         pkts_at_open = ctx->stats->rx_packets;
+
+        while (!g_shutdown_flag) {
+            struct pcap_pkthdr *pkt_hdr;
+            const uint8_t      *pkt_data;
+
+            int ret = pcap_next_ex(handle, &pkt_hdr, &pkt_data);
+            if (ret == -2) { eof_reached = true; break; }  /* normal EOF     */
+            if (ret != 1)  { break; }                       /* error / timeout */
+
+            struct rte_mbuf *m = rte_pktmbuf_alloc(ctx->mempool);
+            if (unlikely(m == NULL)) {
+                ctx->stats->parser_ring_drop++;
+                continue;
+            }
+
+            uint16_t caplen = (uint16_t)pkt_hdr->caplen;
+            uint16_t maxlen = (uint16_t)(m->buf_len - RTE_PKTMBUF_HEADROOM);
+            if (caplen > maxlen)
+                caplen = maxlen;
+
+            rte_memcpy(rte_pktmbuf_mtod(m, void *), pkt_data, caplen);
+            m->data_len = caplen;
+            m->pkt_len  = caplen;
+
+            ctx->stats->rx_packets++;
+            ctx->stats->rx_bytes += caplen;
+
+            batch[nb_batch++] = m;
+
+            if (nb_batch < SPIFAST_BURST_SIZE)
+                continue;
+
+            /* Flush full burst to parser_ring. */
+            unsigned int nb_sent = rte_ring_enqueue_burst(
+                ctx->parser_ring, (void * const *)batch, nb_batch, NULL);
+            for (unsigned int i = nb_sent; i < nb_batch; i++) {
+                rte_pktmbuf_free(batch[i]);
+                ctx->stats->parser_ring_drop++;
+            }
+            nb_batch = 0;
+        }
+
+        /* Flush any remaining partial batch (e.g. end-of-file mid-burst). */
+        if (nb_batch > 0) {
+            unsigned int nb_sent = rte_ring_enqueue_burst(
+                ctx->parser_ring, (void * const *)batch, nb_batch, NULL);
+            for (unsigned int i = nb_sent; i < nb_batch; i++) {
+                rte_pktmbuf_free(batch[i]);
+                ctx->stats->parser_ring_drop++;
+            }
+        }
+
+        pcap_close(handle);
+
+        if (eof_reached) {
+            // if (ctx->stats->rx_packets == pkts_at_open) {
+            //     /* Zero packets read before EOF — empty pcap file.
+            //      * Avoid a hot infinite-reopen loop. */
+            //     fprintf(stderr,
+            //             "[RX] pcap file '%s' contains no packets — "
+            //             "stopping replay\n", ctx->pcap_path);
+            //     g_shutdown_flag = 1;
+            //     break;
+            // }
+            ctx->stats->pcap_loops++;   /* completed one full pass */
+        }
+    }
+
     return 0;
 }

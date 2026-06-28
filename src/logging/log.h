@@ -1,9 +1,9 @@
 #ifndef SPIFAST_LOG_H
 #define SPIFAST_LOG_H
 
-#include "include/config.h"      /* spifast_config_t   */
-#include "rule/rule_loader.h"    /* spi_rule_t, filter_group_table_t */
-#include "stats/stats.h"         /* stats_snapshot_t   */
+#include "include/config.h"      /* spifast_config_t    */
+#include "rule/rule_loader.h"    /* flat_rule_table_t   */
+#include "stats/stats.h"         /* stats_snapshot_t    */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Logging component  (SDD §2.8, §8.2)
@@ -24,20 +24,18 @@ void log_open(const char *path);
 /* Emit a startup summary: application config, worker count, match mode,
  * PCAP path, rules path.  Then emit one RULE line per loaded rule.
  * Called after rule_loader_load() completes.  SDD §8.2, LOG-004 */
-void log_startup_event(const spifast_config_t     *cfg,
-                       const spi_rule_t            rules[],
-                       uint32_t                    num_rules,
-                       const filter_group_table_t *groups);
+void log_startup_event(const spifast_config_t  *cfg,
+                       const flat_rule_table_t *tbl);
 
 /* Emit the periodic statistics line (once per second).
  * Format defined in SDD §8.3.  SDD §8.2, LOG-002, LOG-003 */
-void log_periodic(const stats_snapshot_t *snap,
-                  const filter_group_table_t *groups);
+void log_periodic(const stats_snapshot_t  *snap,
+                  const flat_rule_table_t *tbl);
 
 /* Emit SESSION_END summary block including group hit table and packet
  * accounting validation result.  SDD §8.2, FR-031, LOG-004 */
-void log_final_summary(const stats_snapshot_t *snap,
-                       const filter_group_table_t *groups);
+void log_final_summary(const stats_snapshot_t  *snap,
+                       const flat_rule_table_t *tbl);
 
 /* Flush and close the log file.  No-op if file was never opened.
  * Called just before rte_eal_cleanup().  SDD §8.2 */
