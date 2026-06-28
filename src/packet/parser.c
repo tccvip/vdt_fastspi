@@ -6,8 +6,14 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 #include <rte_byteorder.h>
+#include <rte_ring.h>
+#include <rte_prefetch.h>
+#include <rte_hash_crc.h>
 
 #include "parser.h"
+
+/* Written by RX lcore; read by Parser, Worker, TX (SDD §6.8). */
+extern volatile int g_shutdown_flag;
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * normalize_flow()  —  SDD §2.3, DD-10  (pure, constant-time, stateless)
@@ -107,6 +113,81 @@ int parse_packet(struct rte_mbuf *mbuf, pkt_meta_t *meta)
 
     /* Steps 5–6: five-tuple is assembled; apply bidirectional normalisation */
     normalize_flow(meta);
+
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * parser_lcore_func()  —  SDD §2.3 (Parser lcore hot loop)
+ *
+ * Dequeues bursts from parser_ring, prefetches packet data, calls parse_packet()
+ * writing five-tuple metadata directly into each mbuf's headroom, then
+ * hash-dispatches to the target worker_ring.
+ *
+ * Prefetch pattern (SDD §2.3, SPIFAST_PREFETCH_AHEAD = 4):
+ *   Pre-prime the first PREFETCH_AHEAD entries before the main loop, then
+ *   issue one rolling prefetch per iteration to keep packet data in L1 cache.
+ *
+ * Ownership (SDD §6.7):
+ *   On successful parse + enqueue → ownership transfers to the Worker lcore.
+ *   On parse failure or ring-full   → rte_pktmbuf_free() returns mbuf to pool.
+ * ───────────────────────────────────────────────────────────────────────────── */
+int parser_lcore_func(void *arg)
+{
+    parser_ctx_t         *ctx   = (parser_ctx_t *)arg;
+    parser_lcore_stats_t *stats = ctx->stats;
+
+    struct rte_mbuf *pkts[SPIFAST_BURST_SIZE];
+
+    while (!g_shutdown_flag || !rte_ring_empty(ctx->parser_ring)) {
+        unsigned int nb = rte_ring_dequeue_burst(ctx->parser_ring,
+                                                  (void **)pkts,
+                                                  SPIFAST_BURST_SIZE, NULL);
+        if (nb == 0)
+            continue;
+
+        stats->received += nb;
+
+        /* Pre-prime prefetch for the first PREFETCH_AHEAD packets so their
+         * data is in-flight before the processing loop begins. */
+        unsigned int pre = nb < SPIFAST_PREFETCH_AHEAD
+                             ? nb : SPIFAST_PREFETCH_AHEAD;
+        for (unsigned int j = 0; j < pre; j++)
+            rte_prefetch0(rte_pktmbuf_mtod(pkts[j], void *));
+
+        for (unsigned int i = 0; i < nb; i++) {
+            /* Rolling prefetch: start fetching packet i+PREFETCH_AHEAD while
+             * processing packet i to hide the L1 miss latency. */
+            if (i + SPIFAST_PREFETCH_AHEAD < nb)
+                rte_prefetch0(rte_pktmbuf_mtod(pkts[i + SPIFAST_PREFETCH_AHEAD],
+                                                void *));
+
+            /* Write parsed five-tuple directly into mbuf headroom (DD-17).
+             * parse_packet() also calls normalize_flow() before returning. */
+            pkt_meta_t *meta = pkt_meta_of(pkts[i]);
+            if (parse_packet(pkts[i], meta) != 0) {
+                rte_pktmbuf_free(pkts[i]);
+                stats->invalid++;
+                continue;
+            }
+            stats->parsed++;
+
+            /* Hash dispatch: normalised five-tuple → deterministic worker slot.
+             * Ensures all packets of the same flow reach the same Worker lcore,
+             * keeping ACL Stage-2 context warm in its L1 cache (DD-14). */
+            uint32_t worker_idx = rte_hash_crc(meta, sizeof(pkt_meta_t), 0)
+                                  % ctx->num_workers;
+
+            int rc = rte_ring_enqueue(ctx->worker_rings[worker_idx], pkts[i]);
+            if (rc != 0) {
+                /* worker_ring full: free mbuf, ownership returns to pool */
+                rte_pktmbuf_free(pkts[i]);
+                stats->ring_drop++;
+                continue;
+            }
+            stats->dispatched++;
+        }
+    }
 
     return 0;
 }

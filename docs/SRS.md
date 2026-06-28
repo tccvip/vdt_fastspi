@@ -6,7 +6,7 @@
 
 **Mã tài liệu:** SPIFAST-SRS-001
 
-**Phiên bản:** 1.0
+**Phiên bản:** 1.1
 
 **Trạng thái:** Baseline
 
@@ -23,6 +23,7 @@
 | 0.1 | 2025-06-20 | Kỹ thuật hệ thống | Bản thảo ban đầu |
 | 0.2 | 2025-06-24 | Kỹ thuật hệ thống | Cập nhật theo kết quả rà soát căn chỉnh kiến trúc |
 | 1.0 | 2025-06-26 | Kỹ thuật hệ thống | Baseline sau khi làm rõ yêu cầu |
+| 1.1 | 2026-06-27 | Kỹ thuật hệ thống | Thay thế giới hạn "100 rule" bằng mô hình phân cấp filter-group / filter (FR-019, CON-07) |
 
 ---
 
@@ -374,9 +375,9 @@ Hệ thống phải nạp toàn bộ bộ rule từ file cấu hình trong quá 
 
 Việc chỉnh sửa bộ rule đã nạp trong runtime không được yêu cầu và không được hỗ trợ.
 
-**FR-019 — Giới Hạn Số Lượng Rule**
+**FR-019 — Giới Hạn Số Lượng Filter-Group và Filter**
 
-Hệ thống phải hỗ trợ bộ rule chứa ít hơn 100 rule. Hành vi đối với bộ rule vượt quá giới hạn này là không xác định và không cần được hỗ trợ.
+Hệ thống phải hỗ trợ tối đa **4096 filter-group**, mỗi filter-group chứa tối đa **2048 filter**. Hành vi đối với cấu hình vượt quá các giới hạn này là không xác định và không cần được hỗ trợ.
 
 **FR-020 — Đếm Lượt Khớp Rule (Rule Hit Counting)**
 
@@ -979,7 +980,7 @@ Tiêu chí chấp nhận: Tất cả bộ đếm rule hit ≥ 1. Throughput và 
 | CON-04 | Hệ thống phải sử dụng DPDK PCAP Virtual Device (net_pcap PMD) là cơ chế đầu vào gói tin duy nhất. Phần cứng NIC vật lý không được yêu cầu và không được hỗ trợ. |
 | CON-05 | Hệ thống phải chỉ hỗ trợ IPv4. IPv6 bị loại trừ tường minh. |
 | CON-06 | Nạp rule là tĩnh. Chỉnh sửa rule trong runtime không được hỗ trợ. |
-| CON-07 | Số lượng rule tối đa được hỗ trợ là 99 rule (ít hơn 100). |
+| CON-07 | Hệ thống hỗ trợ tối đa 4096 filter-group; mỗi filter-group hỗ trợ tối đa 2048 filter. |
 | CON-08 | Hệ thống phải có thể triển khai trên một máy đơn lẻ mà không cần hạ tầng mạng bên ngoài. |
 | CON-09 | Hệ thống build phải sử dụng Makefile hoặc CMake, có thể biên dịch bằng GCC trên Linux không có lỗi hay cảnh báo. |
 

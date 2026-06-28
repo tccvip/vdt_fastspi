@@ -63,7 +63,16 @@ typedef struct {
  * Public API  (SDD §2.4)
  * ───────────────────────────────────────────────────────────────────────────── */
 
-/* Load, validate and compile rules from path.
+/* Parse and validate a rule file (steps 1-3 of SDD §5.2).
+ * Populates group_table and rules[] without calling acl_engine_build().
+ * Useful for unit testing the parsing logic in isolation.
+ * Returns 0 on success, -1 on any parse or validation error. */
+int rule_loader_parse(const char          *path,
+                      filter_group_table_t *group_table,
+                      spi_rule_t           rules[],
+                      uint32_t            *num_rules);
+
+/* Load, validate and compile rules from path (all 5 steps of SDD §5.2).
  * Populates group_table and rules[]; calls acl_engine_build() on success.
  * Returns 0 on success, -1 on any validation or build error (with logging).
  * Partial rule loads are not permitted (SRS RC-006).  SDD §5.2 */

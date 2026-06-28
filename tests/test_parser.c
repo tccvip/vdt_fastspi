@@ -20,6 +20,8 @@
 
 #include "packet/parser.h"
 
+volatile int g_shutdown_flag = 0;   /* unused in this test */
+
 /* ─── minimal harness ──────────────────────────────────────────────────────── */
 static int g_pass = 0;
 static int g_fail = 0;

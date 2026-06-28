@@ -87,6 +87,28 @@ target_link_libraries(test_parser PRIVATE
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# test_rule_loader — unit tests for rule parsing and validation
+# Uses rule_loader_parse() (steps 1-3 only) so EAL init is not required.
+# Links acl_engine.c to satisfy rule_loader_load()'s reference to
+# acl_engine_build() (currently a stub returning -1).
+# Build: cmake --build build --target test_rule_loader
+# Run:   build/test_rule_loader
+# ─────────────────────────────────────────────────────────────────────────────
+add_executable(test_rule_loader
+    tests/test_rule_loader.c
+    src/rule/rule_loader.c
+    src/rule/acl_engine.c
+)
+target_include_directories(test_rule_loader PRIVATE src ${DPDK_INCLUDE_DIRS})
+target_compile_options(test_rule_loader PRIVATE ${DPDK_CFLAGS_OTHER})
+target_link_options(test_rule_loader PRIVATE ${DPDK_LDFLAGS})
+target_link_libraries(test_rule_loader PRIVATE
+    ${DPDK_LIBRARIES}
+    ${PCAP_LIBRARY}
+    m pthread dl numa
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Install
 # ─────────────────────────────────────────────────────────────────────────────
 install(TARGETS spifast RUNTIME DESTINATION bin)

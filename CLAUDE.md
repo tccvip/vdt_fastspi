@@ -1,9 +1,18 @@
 Project: SPIFast - High Performance Shallow Packet Inspection using DPDK
 
 Architecture source of truth:
+
+Current:
 - docs/SRS.md
 - docs/HLD.md
 - docs/SDD.md
+
+Previous implementation may not match current architecture.
+
+Before implementing new modules:
+- Review existing code
+- Keep compatible parts
+- Refactor if architecture changed
 
 Rules:
 - Follow SDD exactly.
