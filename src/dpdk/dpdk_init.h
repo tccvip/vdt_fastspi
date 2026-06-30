@@ -45,7 +45,7 @@
 #define SPIFAST_PARSER_RING_SIZE          65536  /* Tier 1: RX → Parser (SPSC) */
 #endif
 #ifndef SPIFAST_RING_SIZE
-#define SPIFAST_RING_SIZE                 4096  /* Tier 2: Parser → Worker[i] (SPSC) */
+#define SPIFAST_RING_SIZE                 2048  /* Tier 2: Parser → Worker[i] (SPSC) */
 #endif
 #ifndef SPIFAST_TX_RING_SIZE
 #define SPIFAST_TX_RING_SIZE              65536  /* Tier 3: Worker×N → TX (MPSC) */
@@ -82,6 +82,8 @@
 
 /* Cache-line size for stats padding (architecture constant) */
 #define CACHE_LINE_SIZE                   64
+
+#define PERF_SUCCESS 0.001
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Runtime DPDK resources produced by dpdk_init()  (SDD §2.1)

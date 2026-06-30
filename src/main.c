@@ -253,9 +253,10 @@ int main(int argc, char *argv[])
         if ((now - last_collect) >= interval_cyc) {
             stats_snapshot_t snap = stats_collect();
             log_periodic(&snap, &g_flat_rule_table);
-            perf_report(&g_perf_ctx, hz,
+            log_perf_report(&g_perf_ctx, hz,
                         snap.interval_pps, snap.interval_mbps,
-                        snap.total_rx_pkts, snap.total_tx_pkts);
+                        snap.total_rx_pkts, snap.total_tx_pkts,
+                        g_worker_stats, &g_parser_stats);
             last_collect = now;
         }
     }
@@ -267,9 +268,10 @@ int main(int argc, char *argv[])
     stats_snapshot_t final_snap = stats_collect();
     validate_packet_accounting(&final_snap);
     log_final_summary(&final_snap, &g_flat_rule_table);
-    perf_report(&g_perf_ctx, hz,
+    log_perf_report(&g_perf_ctx, hz,
                 final_snap.interval_pps, final_snap.interval_mbps,
-                final_snap.total_rx_pkts, final_snap.total_tx_pkts);
+                final_snap.total_rx_pkts, final_snap.total_tx_pkts,
+                g_worker_stats, &g_parser_stats);
     log_close();
     acl_engine_destroy();
     dpdk_cleanup(&g_dpdk);

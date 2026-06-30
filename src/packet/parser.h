@@ -22,8 +22,11 @@ typedef struct {
     uint64_t invalid;     /* mbufs freed due to parse failure                  */
     uint64_t dispatched;  /* mbufs successfully enqueued to a worker_ring      */
     uint64_t ring_drop;   /* mbufs freed because target worker_ring was full   */
+    /* Per-worker dispatch breakdown — written by Parser, read by main/stats.
+     * Used to detect hash-dispatch imbalance when debugging multi-worker perf. */
+    uint64_t dispatched_to[SPIFAST_MAX_WORKERS];
     uint8_t  _pad[CACHE_LINE_SIZE
-                  - (5 * sizeof(uint64_t)) % CACHE_LINE_SIZE];
+                  - ((5 + SPIFAST_MAX_WORKERS) * sizeof(uint64_t)) % CACHE_LINE_SIZE];
 } __rte_cache_aligned parser_lcore_stats_t;
 
 /* ─────────────────────────────────────────────────────────────────────────────

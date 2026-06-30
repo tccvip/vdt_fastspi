@@ -197,6 +197,7 @@ int parser_lcore_func(void *arg)
                 continue;
             }
             stats->dispatched++;
+            stats->dispatched_to[worker_idx]++;
         }
 
         if (do_sample) {

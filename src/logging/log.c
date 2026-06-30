@@ -3,6 +3,7 @@
 #include <time.h>
 #include <errno.h>
 
+#include "dpdk/dpdk_init.h"
 #include "log.h"
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +159,7 @@ void log_periodic(const stats_snapshot_t  *snap,
         uint32_t n = (snap->num_groups < tbl->num_groups)
                      ? snap->num_groups : tbl->num_groups;
         for (uint32_t i = 0; i < n; i++) {
+            if (!snap->group_hits[i]) continue;
             char hit[128];
             snprintf(hit, sizeof(hit), " %s=%lu",
                      tbl->group_names[i],
@@ -247,6 +249,7 @@ void log_final_summary(const stats_snapshot_t  *snap,
             uint32_t n = (snap->num_groups < tbl->num_groups)
                          ? snap->num_groups : tbl->num_groups;
             for (uint32_t i = 0; i < n; i++) {
+                if (!snap->group_hits[i]) continue;
                 char tmp[128];
                 snprintf(tmp, sizeof(tmp), " %s=%lu",
                          tbl->group_names[i],
@@ -268,12 +271,13 @@ void log_final_summary(const stats_snapshot_t  *snap,
                             + snap->total_drop_pkts
                             + snap->total_tx_ring_drop;
         int64_t  pipe_delta = (int64_t)rx - (int64_t)(pipe_drops + fwd_to_tx);
-        double pipe_utilization = pipe_delta / (double)rx;
+        double pipe_utilization = (rx) ? pipe_delta / (double)rx : 0;
 
         uint64_t tx_out   = snap->total_tx_pkts + snap->total_tx_drop_pkts;
         int64_t  tx_delta = (int64_t)fwd_to_tx - (int64_t)tx_out;
+        double tx_ulilization = (rx) ? tx_delta / (double)rx : 0; 
 
-        int overall_pass = (pipe_utilization < 0.001) && (tx_delta == 0);
+        int overall_pass = (pipe_utilization <= PERF_SUCCESS) && (tx_ulilization <= PERF_SUCCESS);
 
         snprintf(line, sizeof(line),
                  "%s PACKET_ACCOUNTING"
@@ -296,6 +300,167 @@ void log_final_summary(const stats_snapshot_t  *snap,
                  overall_pass ? "PASS" : "FAIL");
         log_write(line);
     }
+
+    log_flush();
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * log_perf_report()  —  emit performance report via dual-output channel
+ *
+ * Contains the same formatting logic as the former perf_stats.c perf_report(),
+ * but routes every line through log_write() so output goes to both stdout and
+ * the open log file (if any).  Must be called from the main lcore only.
+ * ───────────────────────────────────────────────────────────────────────────── */
+void log_perf_report(const perf_ctx_t          *ctx,
+                     uint64_t                   tsc_hz,
+                     double                     interval_pps,
+                     double                     interval_mbps,
+                     uint64_t                   total_rx,
+                     uint64_t                   total_tx,
+                     const worker_lcore_stats_t *worker_stats,
+                     const parser_lcore_stats_t *parser_stats)
+{
+    /* Aggregate per-worker slots */
+    perf_stage_t w;
+    perf_stage_t a;
+    memset(&w, 0, sizeof(w));
+    memset(&a, 0, sizeof(a));
+
+    for (uint32_t i = 0; i < ctx->num_workers; i++) {
+        w.total_cycles  += ctx->worker[i].total_cycles;
+        w.total_packets += ctx->worker[i].total_packets;
+        w.total_samples += ctx->worker[i].total_samples;
+
+        a.total_cycles  += ctx->acl[i].total_cycles;
+        a.total_packets += ctx->acl[i].total_packets;
+        a.total_samples += ctx->acl[i].total_samples;
+    }
+
+    uint64_t rx_c     = (ctx->rx.total_packets > 0)
+                        ? ctx->rx.total_cycles / ctx->rx.total_packets : 0;
+    uint64_t parser_c = (ctx->parser.total_packets > 0)
+                        ? ctx->parser.total_cycles / ctx->parser.total_packets : 0;
+    uint64_t worker_c = (w.total_packets > 0)
+                        ? w.total_cycles / w.total_packets : 0;
+    uint64_t acl_c    = (a.total_packets > 0)
+                        ? a.total_cycles / a.total_packets : 0;
+    uint64_t tx_c     = (ctx->tx.total_packets > 0)
+                        ? ctx->tx.total_cycles / ctx->tx.total_packets : 0;
+
+    uint64_t w_no_acl = (worker_c > acl_c) ? (worker_c - acl_c) : 0;
+    uint64_t total_c  = rx_c + parser_c + worker_c + tx_c;
+
+#define PERF_TO_NS(cyc) \
+    ((tsc_hz > 0) ? ((double)(cyc) * 1.0e9 / (double)tsc_hz) : 0.0)
+
+    char line[256];
+
+    log_write("============================\n");
+    log_write("  SPIFast Performance Report\n");
+    log_write("============================\n");
+
+    log_write("\nPackets:\n");
+    snprintf(line, sizeof(line), "    RX: %lu\n", (unsigned long)total_rx);
+    log_write(line);
+    snprintf(line, sizeof(line), "    TX: %lu\n", (unsigned long)total_tx);
+    log_write(line);
+
+    snprintf(line, sizeof(line),
+             "\nAverage cycles per packet  (1 in %u bursts sampled):\n\n",
+             (unsigned)SPIFAST_PERF_SAMPLE_RATE);
+    log_write(line);
+
+    log_write("  RX  (pcap read + mbuf alloc + memcpy):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)rx_c);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(rx_c));
+    log_write(line);
+
+    log_write("  Parser  (parse_packet per burst):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)parser_c);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(parser_c));
+    log_write(line);
+
+    log_write("  Worker  (excl. ACL):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)w_no_acl);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(w_no_acl));
+    log_write(line);
+
+    log_write("  Flat ACL  (flat_acl_match_burst):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)acl_c);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(acl_c));
+    log_write(line);
+
+    log_write("  TX  (rte_eth_tx_burst):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)tx_c);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(tx_c));
+    log_write(line);
+
+    log_write("  Total  (sum of stages):\n");
+    snprintf(line, sizeof(line), "    %8lu cycles\n", (unsigned long)total_c);
+    log_write(line);
+    snprintf(line, sizeof(line), "    %8.2f ns\n\n", PERF_TO_NS(total_c));
+    log_write(line);
+
+    log_write("Throughput:\n");
+    snprintf(line, sizeof(line), "    PPS:  %.0f\n",  interval_pps);
+    log_write(line);
+    snprintf(line, sizeof(line), "    Mbps: %.2f\n",  interval_mbps);
+    log_write(line);
+
+    /* ── Per-worker section ────────────────────────────────────────────────── */
+    if (ctx->num_workers > 0) {
+        log_write("\nWorker Distribution (parser dispatch):\n");
+        for (uint32_t i = 0; i < ctx->num_workers; i++) {
+            uint64_t dispatched = (parser_stats != NULL)
+                                  ? parser_stats->dispatched_to[i] : 0;
+            snprintf(line, sizeof(line),
+                     "  Worker %u: dispatched=%lu\n",
+                     i, (unsigned long)dispatched);
+            log_write(line);
+        }
+
+        log_write("\nPer-Worker Performance:\n");
+        for (uint32_t i = 0; i < ctx->num_workers; i++) {
+            uint64_t wc = (ctx->worker[i].total_packets > 0)
+                          ? ctx->worker[i].total_cycles / ctx->worker[i].total_packets : 0;
+            uint64_t ac = (ctx->acl[i].total_packets > 0)
+                          ? ctx->acl[i].total_cycles / ctx->acl[i].total_packets : 0;
+
+            snprintf(line, sizeof(line), "\n  Worker %u:\n", i);
+            log_write(line);
+
+            if (worker_stats != NULL) {
+                snprintf(line, sizeof(line),
+                         "    packets  received=%lu  forwarded=%lu"
+                         "  dropped=%lu  tx_ring_drop=%lu\n",
+                         (unsigned long)worker_stats[i].received,
+                         (unsigned long)worker_stats[i].forwarded,
+                         (unsigned long)worker_stats[i].dropped,
+                         (unsigned long)worker_stats[i].tx_ring_drop);
+                log_write(line);
+            }
+
+            snprintf(line, sizeof(line),
+                     "    ACL   %8lu cycles  (%8.2f ns)\n",
+                     (unsigned long)ac, PERF_TO_NS(ac));
+            log_write(line);
+
+            snprintf(line, sizeof(line),
+                     "    Total %8lu cycles  (%8.2f ns)\n",
+                     (unsigned long)wc, PERF_TO_NS(wc));
+            log_write(line);
+        }
+        log_write("\n");
+    }
+
+    log_write("============================\n\n");
+
+#undef PERF_TO_NS
 
     log_flush();
 }

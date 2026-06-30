@@ -1,9 +1,12 @@
 #ifndef SPIFAST_LOG_H
 #define SPIFAST_LOG_H
 
-#include "include/config.h"      /* spifast_config_t    */
-#include "rule/rule_loader.h"    /* flat_rule_table_t   */
-#include "stats/stats.h"         /* stats_snapshot_t    */
+#include "include/config.h"      /* spifast_config_t        */
+#include "rule/rule_loader.h"    /* flat_rule_table_t       */
+#include "stats/stats.h"         /* stats_snapshot_t        */
+#include "perf/perf_stats.h"     /* perf_ctx_t              */
+#include "worker/worker.h"       /* worker_lcore_stats_t    */
+#include "packet/parser.h"       /* parser_lcore_stats_t    */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Logging component  (SDD §2.8, §8.2)
@@ -36,6 +39,23 @@ void log_periodic(const stats_snapshot_t  *snap,
  * accounting validation result.  SDD §8.2, FR-031, LOG-004 */
 void log_final_summary(const stats_snapshot_t  *snap,
                        const flat_rule_table_t *tbl);
+
+/* Emit the performance report (stage cycle counts, throughput, per-worker
+ * breakdown) via the dual-output channel.  Called from the main lcore after
+ * log_final_summary().
+ *
+ * worker_stats: array of num_workers entries (g_worker_stats in main.c).
+ * parser_stats: single parser stats struct — provides dispatched_to[] for
+ *               per-worker dispatch balance reporting.  May be NULL (section
+ *               omitted if so). */
+void log_perf_report(const perf_ctx_t          *ctx,
+                     uint64_t                   tsc_hz,
+                     double                     interval_pps,
+                     double                     interval_mbps,
+                     uint64_t                   total_rx,
+                     uint64_t                   total_tx,
+                     const worker_lcore_stats_t *worker_stats,
+                     const parser_lcore_stats_t *parser_stats);
 
 /* Flush and close the log file.  No-op if file was never opened.
  * Called just before rte_eal_cleanup().  SDD §8.2 */
