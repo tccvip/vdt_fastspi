@@ -9,6 +9,7 @@
 #include <rte_memcpy.h>
 #include <rte_ring.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 
 #include "rx.h"
 
@@ -44,8 +45,9 @@ extern volatile int g_shutdown_flag;
  * ───────────────────────────────────────────────────────────────────────────── */
 int rx_lcore_func(void *arg)
 {
-    rx_ctx_t *ctx = (rx_ctx_t *)arg;
-    char      errbuf[PCAP_ERRBUF_SIZE];
+    rx_ctx_t    *ctx          = (rx_ctx_t *)arg;
+    char         errbuf[PCAP_ERRBUF_SIZE];
+    uint64_t     rx_pkt_count = 0;   /* counts every successfully-read packet */
 
     while (!g_shutdown_flag) {
         pcap_t *handle = pcap_open_offline(ctx->pcap_path, errbuf);
@@ -59,11 +61,15 @@ int rx_lcore_func(void *arg)
         struct rte_mbuf *batch[SPIFAST_BURST_SIZE];
         unsigned int     nb_batch    = 0;
         bool             eof_reached = false;
-        uint64_t         pkts_at_open = ctx->stats->rx_packets;
 
         while (!g_shutdown_flag) {
             struct pcap_pkthdr *pkt_hdr;
             const uint8_t      *pkt_data;
+
+            /* Sampling: capture rdtsc before pcap read on every Nth packet. */
+            bool     do_sample = (ctx->perf != NULL) &&
+                                 (rx_pkt_count % SPIFAST_PERF_SAMPLE_RATE == 0);
+            uint64_t t0        = do_sample ? rte_rdtsc() : 0;
 
             int ret = pcap_next_ex(handle, &pkt_hdr, &pkt_data);
             if (ret == -2) { eof_reached = true; break; }  /* normal EOF     */
@@ -71,7 +77,8 @@ int rx_lcore_func(void *arg)
 
             struct rte_mbuf *m = rte_pktmbuf_alloc(ctx->mempool);
             if (unlikely(m == NULL)) {
-                ctx->stats->parser_ring_drop++;
+                ctx->stats->alloc_fail++;   /* pool exhausted — separate from ring-full */
+                rx_pkt_count++;
                 continue;
             }
 
@@ -83,6 +90,13 @@ int rx_lcore_func(void *arg)
             rte_memcpy(rte_pktmbuf_mtod(m, void *), pkt_data, caplen);
             m->data_len = caplen;
             m->pkt_len  = caplen;
+
+            if (do_sample) {
+                ctx->perf->total_cycles  += rte_rdtsc() - t0;
+                ctx->perf->total_packets++;
+                ctx->perf->total_samples++;
+            }
+            rx_pkt_count++;
 
             ctx->stats->rx_packets++;
             ctx->stats->rx_bytes += caplen;
@@ -125,6 +139,7 @@ int rx_lcore_func(void *arg)
             //     break;
             // }
             ctx->stats->pcap_loops++;   /* completed one full pass */
+            // rte_delay_us_sleep(1000);
         }
     }
 

@@ -20,6 +20,7 @@
 #include "tx/tx.h"
 #include "stats/stats.h"
 #include "logging/log.h"
+#include "perf/perf_stats.h"
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Global application state (read-only after initialisation)
@@ -37,6 +38,7 @@ static rx_ctx_t              g_rx_ctx;
 static parser_ctx_t          g_parser_ctx;
 static worker_ctx_t          g_worker_ctx[SPIFAST_MAX_WORKERS];
 static tx_ctx_t              g_tx_ctx;
+static perf_ctx_t            g_perf_ctx;
 
 /* Set to 1 by SIGINT/SIGTERM; polled by all lcores to drain and exit.
  * NOT set by pcap EOF — the RX lcore loops the file indefinitely. */
@@ -198,17 +200,21 @@ int main(int argc, char *argv[])
     };
     stats_init(&stats_ctx);
 
+    g_perf_ctx.num_workers = g_config.num_workers;
+
     g_rx_ctx.port_id     = g_dpdk.port_id;
     g_rx_ctx.parser_ring = g_dpdk.parser_ring;
     g_rx_ctx.stats       = &g_rx_stats;
     g_rx_ctx.pcap_path   = g_config.pcap_path;
     g_rx_ctx.mempool     = g_dpdk.mempool;
+    g_rx_ctx.perf        = &g_perf_ctx.rx;
 
     g_parser_ctx.parser_ring = g_dpdk.parser_ring;
     g_parser_ctx.num_workers = g_config.num_workers;
     for (uint32_t i = 0; i < g_config.num_workers; i++)
         g_parser_ctx.worker_rings[i] = g_dpdk.worker_rings[i];
     g_parser_ctx.stats = &g_parser_stats;
+    g_parser_ctx.perf  = &g_perf_ctx.parser;
 
     for (uint32_t i = 0; i < g_config.num_workers; i++) {
         g_worker_ctx[i].ring            = g_dpdk.worker_rings[i];
@@ -216,12 +222,15 @@ int main(int argc, char *argv[])
         g_worker_ctx[i].flat_rule_table = acl_get_flat_rule_table();
         g_worker_ctx[i].worker_idx      = i;
         g_worker_ctx[i].stats           = &g_worker_stats[i];
+        g_worker_ctx[i].perf_worker     = &g_perf_ctx.worker[i];
+        g_worker_ctx[i].perf_acl        = &g_perf_ctx.acl[i];
     }
 
     g_tx_ctx.tx_ring     = g_dpdk.tx_ring;
     g_tx_ctx.port_id     = g_dpdk.port_id;
     g_tx_ctx.tx_queue_id = 0;
     g_tx_ctx.stats       = &g_tx_stats;
+    g_tx_ctx.perf        = &g_perf_ctx.tx;
 
     signal(SIGINT,  spifast_sighandler);
     signal(SIGTERM, spifast_sighandler);
@@ -244,6 +253,9 @@ int main(int argc, char *argv[])
         if ((now - last_collect) >= interval_cyc) {
             stats_snapshot_t snap = stats_collect();
             log_periodic(&snap, &g_flat_rule_table);
+            perf_report(&g_perf_ctx, hz,
+                        snap.interval_pps, snap.interval_mbps,
+                        snap.total_rx_pkts, snap.total_tx_pkts);
             last_collect = now;
         }
     }
@@ -255,6 +267,9 @@ int main(int argc, char *argv[])
     stats_snapshot_t final_snap = stats_collect();
     validate_packet_accounting(&final_snap);
     log_final_summary(&final_snap, &g_flat_rule_table);
+    perf_report(&g_perf_ctx, hz,
+                final_snap.interval_pps, final_snap.interval_mbps,
+                final_snap.total_rx_pkts, final_snap.total_tx_pkts);
     log_close();
     acl_engine_destroy();
     dpdk_cleanup(&g_dpdk);

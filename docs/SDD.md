@@ -32,6 +32,7 @@
 | 1.0 | 2025-06-26 | Kỹ thuật hệ thống | Baseline SDD căn chỉnh với HLD v1.1 và SRS v1.0 |
 | 1.1 | 2025-06-28 | Kỹ thuật hệ thống | Cập nhật theo HLD v1.3: pipeline 5 giai đoạn; tách Parser lcore riêng; ACL classify batch two-stage tại Worker; thêm TX lcore; ba tầng ring SPSC/SPSC/MPSC; metadata qua mbuf headroom; hash dispatch tại Parser |
 | 1.2 | 2026-06-28 | Kỹ thuật hệ thống | Mục 4: Thay thế Two-Stage ACL (stage1_ctx + group_ctx[]) bằng Flat Single-Stage ACL (flat_acl_ctx + flat_rule_table_t); loại bỏ lazy build, filter_group_table, acl_result_t; giữ nguyên ACL field definitions và worker burst interface |
+| 1.3 | 2026-06-30 | Kỹ thuật hệ thống | Đồng bộ hóa với cài đặt thực tế: cập nhật rx_lcore_stats_t (thêm rx_bytes, alloc_fail, pcap_loops); cập nhật Section 6.2 RX dùng libpcap; cập nhật hằng số tài nguyên (mempool, ring, burst); cập nhật stats_collect pseudo-code; cập nhật định dạng log |
 
 ---
 
@@ -687,12 +688,14 @@ Tồn tại bốn cấu trúc counter riêng biệt tương ứng với bốn lo
 ```c
 #define CACHE_LINE_SIZE  64
 
-/* RX lcore — chỉ poll và enqueue parser_ring */
+/* RX lcore — đọc libpcap, alloc mbuf, enqueue parser_ring */
 typedef struct {
-    uint64_t rx_packets;          /* tổng mbuf nhận được từ PMD              */
-    uint64_t parser_ring_drop;    /* mbuf bị hủy do parser_ring đầy          */
-    uint8_t  _pad[CACHE_LINE_SIZE
-                  - (2 * sizeof(uint64_t)) % CACHE_LINE_SIZE];
+    uint64_t rx_packets;          /* tổng mbuf nhận được (qua tất cả pcap loops)   */
+    uint64_t rx_bytes;            /* tổng byte (pkt_len) nhận được                 */
+    uint64_t alloc_fail;          /* rte_pktmbuf_alloc() trả về NULL (pool cạn)    */
+    uint64_t parser_ring_drop;    /* mbuf bị hủy do parser_ring đầy               */
+    uint64_t pcap_loops;          /* số lần đã replay xong toàn bộ file pcap       */
+    uint8_t  _pad[CACHE_LINE_SIZE - 5 * sizeof(uint64_t)];
 } __rte_cache_aligned rx_lcore_stats_t;
 
 /* Parser lcore — parse, headroom write, hash dispatch */
@@ -1338,15 +1341,21 @@ Tham số `--lcores` của EAL phải bao gồm ít nhất N+4 lcore. Ví dụ c
 
 ### 6.2 Trách Nhiệm RX lcore
 
-RX lcore thực hiện các bước sau theo từng burst:
+RX lcore đọc packet trực tiếp từ file pcap qua libpcap (không dùng `rte_eth_rx_burst`), replay liên tục cho đến khi nhận SIGINT/SIGTERM. Net_pcap DPDK port vẫn được giữ active để TX lcore gọi `rte_eth_tx_burst()` bình thường.
 
-1. Nhận mbuf qua `rte_eth_rx_burst`.
-2. Thực hiện lightweight hash (placeholder cho future multi-parser scale).
-3. Gọi `rte_ring_enqueue_burst(parser_ring, pkts, nb_rx)`.
-4. Xử lý parser_ring đầy: free mbuf, tăng `parser_ring_drop`.
-5. Cập nhật `rx_lcore_stats.rx_packets`.
+RX lcore thực hiện các bước sau:
 
-RX lcore không gọi bất kỳ hàm I/O nào, `malloc`, `free`, `printf`, hoặc blocking system call.
+1. Gọi `pcap_open_offline(ctx->pcap_path, ...)` để mở file pcap.
+2. Đọc từng packet bằng `pcap_next_ex(handle, &pkt_hdr, &pkt_data)`.
+3. Gọi `rte_pktmbuf_alloc(ctx->mempool)` để lấy mbuf; nếu NULL tăng `alloc_fail` và tiếp tục.
+4. Copy dữ liệu packet vào mbuf bằng `rte_memcpy(rte_pktmbuf_mtod(m), pkt_data, caplen)`.
+5. Tích lũy batch đến `SPIFAST_BURST_SIZE`, rồi flush bằng `rte_ring_enqueue_burst(parser_ring, ...)`.
+6. Xử lý parser_ring đầy: free mbuf, tăng `parser_ring_drop`.
+7. Cập nhật `rx_lcore_stats.rx_packets` và `rx_lcore_stats.rx_bytes`.
+8. Khi EOF (`pcap_next_ex` trả về -2): đóng handle, tăng `pcap_loops`, mở lại từ đầu.
+9. Thoát khi `g_shutdown_flag == 1` (được đặt bởi SIGINT/SIGTERM handler).
+
+RX lcore không gọi `printf` hay bất kỳ blocking system call nào trên data path (ngoài libpcap I/O là thiết kế có chủ ý — pcap-bound, không phải CPU-bound).
 
 ### 6.3 Trách Nhiệm Parser lcore
 
@@ -1466,7 +1475,7 @@ Một `rte_mempool` duy nhất được tạo và dùng chung trên tất cả l
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| `nb_mbufs` | `SPIFAST_MEMPOOL_SIZE` = 8192 | Phải vượt số mbuf đang in-flight tối đa: `BURST_SIZE + num_workers × (RING_SIZE + WORKER_BURST_SIZE)`. 8192 cung cấp headroom thoải mái cho đến 4 worker với kích thước ring mặc định. |
+| `nb_mbufs` | `SPIFAST_MEMPOOL_SIZE` = 32768 | Phải vượt số mbuf đang in-flight tối đa: `BURST_SIZE + num_workers × (RING_SIZE + WORKER_BURST_SIZE)`. 32768 cung cấp headroom lớn cho multi-worker với ring size lớn, ngăn `alloc_fail` dưới tải cao. |
 | `cache_size` | 256 | Cache mbuf per-lcore. Giảm tranh chấp mempool khi alloc/free. DPDK khuyến nghị `cache_size < nb_mbufs/1.5` và là lũy thừa của hai. |
 | `priv_size` | 0 | Không cần vùng dữ liệu mbuf private. |
 | `data_room_size` | `RTE_MBUF_DEFAULT_BUF_SIZE` (2176 bytes) | Đủ cho Ethernet MTU tiêu chuẩn (1518 bytes) cộng headroom. |
@@ -1478,7 +1487,7 @@ Một `rte_mempool` duy nhất được tạo và dùng chung trên tất cả l
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| `BURST_SIZE` | 32 | Kích thước DPDK burst tiêu chuẩn. Cân bằng giữa khấu hao overhead per-packet và cache locality. Có thể cấu hình tại compile time. |
+| `BURST_SIZE` | 64 | Kích thước burst RX. Cân bằng giữa khấu hao overhead per-packet và cache locality. Có thể cấu hình tại compile time. |
 | `RX_DESC_DEFAULT` | 512 | Số lượng RX descriptor trong hardware ring của PMD. Phải ≥ `BURST_SIZE`. |
 | `EOI_THRESHOLD` | 100 | Số lần poll burst trống liên tiếp trước khi tuyên bố kết thúc PCAP. |
 
@@ -1488,7 +1497,7 @@ Một `rte_mempool` duy nhất được tạo và dùng chung trên tất cả l
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| `PARSER_RING_SIZE` | 1024 | Lũy thừa của hai. Buffer cho burst imbalance giữa RX và Parser. |
+| `PARSER_RING_SIZE` | 65536 | Lũy thừa của hai. Buffer lớn để hấp thụ burst imbalance giữa RX libpcap và Parser. |
 | `RING_F_SP_ENQ` | Đặt | Single producer (RX lcore) → không có MP enqueue overhead. |
 | `RING_F_SC_DEQ` | Đặt | Single consumer (Parser lcore) → không có MC dequeue overhead. |
 
@@ -1496,19 +1505,19 @@ Một `rte_mempool` duy nhất được tạo và dùng chung trên tất cả l
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| `RING_SIZE` | 1024 | Lũy thừa của hai. Buffer cho hash imbalance giữa Parser và Worker. |
+| `RING_SIZE` | 4096 | Lũy thừa của hai. Buffer cho hash imbalance giữa Parser và Worker. |
 | `RING_F_SP_ENQ` | Đặt | Single producer (Parser lcore) → lock-free tối ưu. |
 | `RING_F_SC_DEQ` | Đặt | Single consumer (Worker lcore i riêng biệt) → lock-free tối ưu. |
-| `WORKER_BURST_SIZE` | 32 | Kích thước dequeue burst để batch ACL classify. |
+| `WORKER_BURST_SIZE` | 32 | Kích thước dequeue burst để batch flat ACL classify. |
 
 **Tầng 3: tx_ring (Worker → TX, MPSC)**
 
 | Tham số | Giá trị | Lý do |
 |---|---|---|
-| `TX_RING_SIZE` | 4096 | Lớn hơn worker_ring vì N Worker enqueue đồng thời vào 1 ring. |
+| `TX_RING_SIZE` | 65536 | Lớn hơn worker_ring vì N Worker enqueue đồng thời vào 1 ring; cần đủ lớn để không làm bottleneck khi nhiều worker. |
 | `RING_F_MP_ENQ` | Đặt | Multi-producer (tất cả N Worker lcore enqueue đồng thời) — bắt buộc. |
 | `RING_F_SC_DEQ` | Đặt | Single consumer (TX lcore) → lock-free dequeue. |
-| `TX_BURST_SIZE` | 32 | Kích thước dequeue burst của TX lcore. |
+| `TX_BURST_SIZE` | 64 | Kích thước dequeue burst của TX lcore. |
 
 **Xử lý ring đầy:** Mọi ring overflow đều dẫn đến free mbuf ngay lập tức và tăng counter tương ứng (`parser_ring_drop`, `worker_ring_drop`, `tx_ring_drop`). Kích thước ring phải đảm bảo tỷ lệ drop tổng cộng ≤ 0,1% (PR-005).
 
@@ -1517,14 +1526,14 @@ Một `rte_mempool` duy nhất được tạo và dùng chung trên tất cả l
 ```
 Hugepage memory (được EAL cấp phát khi khởi động)
 │
-├── rte_mempool (8192 mbufs × 2176 bytes ≈ 17 MB)
+├── rte_mempool (32768 mbufs × 2176 bytes ≈ 69 MB)
 │    └── cache per-lcore (256 entry mỗi cái)
 │
-├── parser_ring     (1024 × 8 bytes = 8 KB, SPSC)
-├── worker_ring[0]  (1024 × 8 bytes = 8 KB, SPSC)
+├── parser_ring     (65536 × 8 bytes = 512 KB, SPSC)
+├── worker_ring[0]  (4096 × 8 bytes = 32 KB, SPSC)
 ├── worker_ring[1]  ...
 ├── worker_ring[N-1]
-├── tx_ring         (4096 × 8 bytes = 32 KB, MPSC)
+├── tx_ring         (65536 × 8 bytes = 512 KB, MPSC)
 │
 └── flat_acl_ctx    (rte_acl context duy nhất chứa tất cả rule, ~vài MB)
 ```
@@ -1544,16 +1553,16 @@ Tất cả cấu trúc DPDK (mempool, ring, acl_ctx) đều nằm trong hugepage
 Các hằng số compile-time sau được định nghĩa trong `src/dpdk/dpdk_init.h` và có thể được override tại build time:
 
 ```c
-#define SPIFAST_MEMPOOL_SIZE              8192
+#define SPIFAST_MEMPOOL_SIZE              32768  /* tăng từ 8192 để tránh alloc_fail dưới tải cao */
 #define SPIFAST_MEMPOOL_CACHE             256
-#define SPIFAST_BURST_SIZE                32
+#define SPIFAST_BURST_SIZE                64     /* tăng từ 32 để cải thiện throughput */
 #define SPIFAST_RX_DESC                   512
 #define SPIFAST_TX_DESC                   512
-#define SPIFAST_PARSER_RING_SIZE          1024
-#define SPIFAST_RING_SIZE                 1024   /* worker_ring per worker */
-#define SPIFAST_TX_RING_SIZE              4096
+#define SPIFAST_PARSER_RING_SIZE          65536  /* tăng từ 1024 để hấp thụ burst libpcap */
+#define SPIFAST_RING_SIZE                 4096   /* tăng từ 1024 (worker_ring per worker) */
+#define SPIFAST_TX_RING_SIZE              65536  /* tăng từ 4096 để tránh bottleneck multi-worker */
 #define SPIFAST_WORKER_BURST              32
-#define SPIFAST_TX_BURST_SIZE             32
+#define SPIFAST_TX_BURST_SIZE             64     /* tăng từ 32 */
 #define SPIFAST_EOI_THRESHOLD             100
 #define SPIFAST_PREFETCH_AHEAD            4
 #define SPIFAST_MAX_GROUPS                4096
@@ -1579,7 +1588,9 @@ stats_collect(prev_snapshot) → stats_snapshot_t:
 
   /* Tổng hợp counter RX lcore */
   cur.total_rx_pkts          = rx_stats.rx_packets
+  cur.total_alloc_fail       = rx_stats.alloc_fail
   cur.total_parser_ring_drop = rx_stats.parser_ring_drop
+  cur.total_pcap_loops       = rx_stats.pcap_loops
 
   /* Tổng hợp counter Parser lcore */
   cur.total_parsed_pkts      = parser_stats.parsed_packets
@@ -1625,6 +1636,8 @@ stats_collect(prev_snapshot) → stats_snapshot_t:
 
   /* Sao chép tổng lũy kế */
   snap.total_rx_pkts         = cur.total_rx_pkts
+  snap.total_alloc_fail      = cur.total_alloc_fail
+  snap.total_pcap_loops      = cur.total_pcap_loops
   snap.total_parsed_pkts     = cur.total_parsed_pkts
   snap.total_fwd_pkts        = cur.total_fwd_pkts
   snap.total_drop_pkts       = cur.total_drop_pkts
@@ -1690,7 +1703,7 @@ static void log_write(const char *msg) {
 **Dòng thống kê định kỳ (LOG-002, LOG-003):**
 
 ```
-[2025-06-26T14:32:05+0700] elapsed=10s  rx=500000  parsed=499800  fwd=489800  drop=9800  inv=200  p_ring_drop=0  w_ring_drop=0  tx=489800  tx_drop=0  mbps=823.40  pps=489800  | fg_l34_facebook=120000 fg_l34_youtube=85000 fg_l34_http_sdf1003=200000 fg_l34_dns_sdf1005=85000 DEFAULT=9800
+[2025-06-26T14:32:05+0700] elapsed=10s  loops=3  rx=500000  fwd=489800  drop=9800  inv=200  alloc_fail=0  p_drop=0  w_drop=0  tx_drop=0  mbps=823.40  pps=489800
 ```
 
 Định nghĩa trường:
@@ -1699,18 +1712,17 @@ static void log_write(const char *msg) {
 |---|---|---|
 | `[timestamp]` | Thời gian địa phương ISO 8601 | — |
 | `elapsed=Ns` | Giây kể từ gói tin đầu tiên | giây |
+| `loops=N` | Số lần đã replay hết file pcap lũy kế | lần |
 | `rx=N` | Gói tin RX lũy kế | gói tin |
-| `parsed=N` | Gói tin đã parse thành công lũy kế | gói tin |
 | `fwd=N` | Gói tin được forward lũy kế (enqueue tx_ring) | gói tin |
 | `drop=N` | Gói tin bị DROP theo rule lũy kế | gói tin |
 | `inv=N` | Gói tin không hợp lệ lũy kế | gói tin |
-| `p_ring_drop=N` | Gói tin bị hủy do parser_ring overflow lũy kế | gói tin |
-| `w_ring_drop=N` | Gói tin bị hủy do worker_ring overflow lũy kế | gói tin |
-| `tx=N` | Gói tin đã truyền ra NIC TX lũy kế | gói tin |
-| `tx_drop=N` | Gói tin bị hủy do TX queue đầy lũy kế | gói tin |
+| `alloc_fail=N` | Lần rte_pktmbuf_alloc() trả về NULL lũy kế | lần |
+| `p_drop=N` | Gói tin bị hủy do parser_ring overflow lũy kế | gói tin |
+| `w_drop=N` | Gói tin bị hủy do worker_ring overflow lũy kế | gói tin |
+| `tx_drop=N` | Tổng mbuf bị hủy ở TX (tx_ring overflow + TX queue đầy) lũy kế | gói tin |
 | `mbps=F` | Throughput theo chu kỳ | Mbps (2 chữ số thập phân) |
 | `pps=N` | PPS theo chu kỳ | gói tin/giây |
-| `\| group=N ...` | Hit lũy kế per-group (aggregate từ tất cả Worker) | gói tin |
 
 **Sự kiện khởi động (LOG-004):**
 
@@ -1726,11 +1738,11 @@ static void log_write(const char *msg) {
 
 ```
 [2025-06-26T14:32:15+0700] SESSION_END
-[2025-06-26T14:32:15+0700] SUMMARY  elapsed=15s  total_rx=750000  total_parsed=749700  total_fwd=734700  total_drop=14700  total_inv=300  total_p_ring_drop=0  total_w_ring_drop=0  total_tx=734700  total_tx_drop=0
+[2025-06-26T14:32:15+0700] SUMMARY  elapsed=15s  pcap_loops=5  total_rx=750000  total_parsed=749700  total_fwd=734700  total_drop=14700  total_inv=300  total_alloc_fail=0  total_p_ring_drop=0  total_w_ring_drop=0  total_tx_ring_drop=0  total_tx_drop=0  total_tx=734700
 [2025-06-26T14:32:15+0700] THROUGHPUT_AVG  mbps=817.33
 [2025-06-26T14:32:15+0700] PPS_AVG  pps=489800
 [2025-06-26T14:32:15+0700] GROUP_HITS  fg_l34_facebook=180000 fg_l34_youtube=127500 fg_l34_http_sdf1003=300000 fg_l34_dns_sdf1005=127500 DEFAULT=14700
-[2025-06-26T14:32:15+0700] PACKET_ACCOUNTING  rx=750000  accounted=750000  lost=0  result=PASS
+[2025-06-26T14:32:15+0700] PACKET_ACCOUNTING  rx=750000  p_ring_drop=0  inv=300  w_ring_drop=0  acl_drop=14700  tx_ring_drop=0  tx_drop=0  tx_pkts=734700  lost=0  result=PASS
 ```
 
 ---
@@ -1980,4 +1992,4 @@ Trình tự build được khuyến nghị tiến hành theo từng giai đoạn
 
 ---
 
-*Kết thúc tài liệu — SPIFAST-SDD-001-VI v1.1*
+*Kết thúc tài liệu — SPIFAST-SDD-001-VI v1.3*

@@ -5,6 +5,7 @@
 #include <rte_common.h>
 #include <rte_ring.h>
 #include "dpdk/dpdk_init.h"   /* CACHE_LINE_SIZE, SPIFAST_* constants */
+#include "perf/perf_stats.h"  /* perf_stage_t                         */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Per-lcore statistics for the RX lcore  (SDD §2.2, §3.5)
@@ -17,9 +18,10 @@
 typedef struct {
     uint64_t rx_packets;        /* total mbufs received (across all pcap loops)  */
     uint64_t rx_bytes;          /* total bytes (sum of pkt_len) received          */
+    uint64_t alloc_fail;        /* rte_pktmbuf_alloc() returned NULL (pool empty) */
     uint64_t parser_ring_drop;  /* mbufs freed because parser_ring was full       */
     uint64_t pcap_loops;        /* number of completed passes through the pcap    */
-    uint8_t  _pad[CACHE_LINE_SIZE - 4 * sizeof(uint64_t)];
+    uint8_t  _pad[CACHE_LINE_SIZE - 5 * sizeof(uint64_t)];
 } __rte_cache_aligned rx_lcore_stats_t;
 
 _Static_assert(sizeof(rx_lcore_stats_t) == CACHE_LINE_SIZE,
@@ -34,6 +36,7 @@ typedef struct {
     rx_lcore_stats_t   *stats;
     const char         *pcap_path;    /* path to pcap file for direct libpcap read  */
     struct rte_mempool *mempool;      /* mbuf pool for rte_pktmbuf_alloc()           */
+    perf_stage_t       *perf;         /* perf counters for this lcore (may be NULL) */
 } rx_ctx_t;
 
 /* ─────────────────────────────────────────────────────────────────────────────

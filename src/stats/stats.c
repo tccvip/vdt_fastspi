@@ -43,6 +43,7 @@ stats_snapshot_t stats_collect(void)
 
     /* ── RX lcore ──────────────────────────────────────────────────────────── */
     snap.total_rx_pkts          = g_ctx->rx_stats->rx_packets;
+    snap.total_alloc_fail       = g_ctx->rx_stats->alloc_fail;
     snap.total_parser_ring_drop = g_ctx->rx_stats->parser_ring_drop;
     snap.total_pcap_loops       = g_ctx->rx_stats->pcap_loops;
 

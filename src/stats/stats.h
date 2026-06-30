@@ -29,6 +29,7 @@ typedef struct {
     uint64_t total_fwd_pkts;          /* sum(worker.forwarded)  ACTION_FORWARD   */
     uint64_t total_drop_pkts;         /* sum(worker.dropped)    ACL action=DROP  */
     uint64_t total_invalid_pkts;      /* parser.invalid         parse failures   */
+    uint64_t total_alloc_fail;        /* rx.alloc_fail          mempool exhausted */
     uint64_t total_parser_ring_drop;  /* rx.parser_ring_drop    RX→Parser ring   */
     uint64_t total_worker_ring_drop;  /* parser.ring_drop       Parser→Worker ring*/
     uint64_t total_tx_ring_drop;      /* sum(worker.tx_ring_drop) Worker→TX ring */

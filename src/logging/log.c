@@ -135,7 +135,7 @@ void log_periodic(const stats_snapshot_t  *snap,
     snprintf(line, sizeof(line),
              "%s elapsed=%lus  loops=%lu"
              "  rx=%lu  fwd=%lu  drop=%lu  inv=%lu"
-             "  p_drop=%lu  w_drop=%lu  tx_drop=%lu"
+             "  alloc_fail=%lu  p_drop=%lu  w_drop=%lu  tx_drop=%lu"
              "  mbps=%.2f  pps=%.0f",
              ts,
              (unsigned long)snap->elapsed_sec,
@@ -144,6 +144,7 @@ void log_periodic(const stats_snapshot_t  *snap,
              (unsigned long)snap->total_fwd_pkts,
              (unsigned long)snap->total_drop_pkts,
              (unsigned long)snap->total_invalid_pkts,
+             (unsigned long)snap->total_alloc_fail,
              (unsigned long)snap->total_parser_ring_drop,
              (unsigned long)snap->total_worker_ring_drop,
              (unsigned long)(snap->total_tx_ring_drop + snap->total_tx_drop_pkts),
@@ -199,6 +200,7 @@ void log_final_summary(const stats_snapshot_t  *snap,
              "  total_fwd=%lu"
              "  total_drop=%lu"
              "  total_inv=%lu"
+             "  total_alloc_fail=%lu"
              "  total_p_ring_drop=%lu"
              "  total_w_ring_drop=%lu"
              "  total_tx_ring_drop=%lu"
@@ -212,6 +214,7 @@ void log_final_summary(const stats_snapshot_t  *snap,
              (unsigned long)snap->total_fwd_pkts,
              (unsigned long)snap->total_drop_pkts,
              (unsigned long)snap->total_invalid_pkts,
+             (unsigned long)snap->total_alloc_fail,
              (unsigned long)snap->total_parser_ring_drop,
              (unsigned long)snap->total_worker_ring_drop,
              (unsigned long)snap->total_tx_ring_drop,

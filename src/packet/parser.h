@@ -8,6 +8,7 @@
 #include "pkt_ctx.h"           /* pkt_meta_t, pkt_meta_of, pkt_meta_read */
 #include "dpdk/dpdk_init.h"    /* SPIFAST_MAX_WORKERS, SPIFAST_BURST_SIZE,
                                    SPIFAST_PREFETCH_AHEAD, CACHE_LINE_SIZE */
+#include "perf/perf_stats.h"   /* perf_stage_t                            */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Per-lcore statistics for the Parser lcore  (SDD §3.5)
@@ -33,6 +34,7 @@ typedef struct {
     struct rte_ring      *worker_rings[SPIFAST_MAX_WORKERS]; /* SPSC: enqueue targets */
     uint32_t              num_workers;
     parser_lcore_stats_t *stats;
+    perf_stage_t         *perf;   /* perf counters for this lcore (may be NULL) */
 } parser_ctx_t;
 
 /* ─────────────────────────────────────────────────────────────────────────────

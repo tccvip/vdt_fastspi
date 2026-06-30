@@ -14,7 +14,7 @@
 
 /* Mempool */
 #ifndef SPIFAST_MEMPOOL_SIZE
-#define SPIFAST_MEMPOOL_SIZE              8192
+#define SPIFAST_MEMPOOL_SIZE              32768
 #endif
 #ifndef SPIFAST_MEMPOOL_CACHE
 #define SPIFAST_MEMPOOL_CACHE             256
@@ -22,7 +22,7 @@
 
 /* Burst sizes */
 #ifndef SPIFAST_BURST_SIZE
-#define SPIFAST_BURST_SIZE                32    /* RX burst */
+#define SPIFAST_BURST_SIZE                64    /* RX burst */
 #endif
 #ifndef SPIFAST_WORKER_BURST
 #define SPIFAST_WORKER_BURST              32    /* Worker dequeue burst */
@@ -42,10 +42,10 @@
 /* Ring sizes — three-tier pipeline (SDD §7.3)
  * All sizes must be a power of two (rte_ring requirement). */
 #ifndef SPIFAST_PARSER_RING_SIZE
-#define SPIFAST_PARSER_RING_SIZE          4096  /* Tier 1: RX → Parser (SPSC) */
+#define SPIFAST_PARSER_RING_SIZE          65536  /* Tier 1: RX → Parser (SPSC) */
 #endif
 #ifndef SPIFAST_RING_SIZE
-#define SPIFAST_RING_SIZE                 1024  /* Tier 2: Parser → Worker[i] (SPSC) */
+#define SPIFAST_RING_SIZE                 4096  /* Tier 2: Parser → Worker[i] (SPSC) */
 #endif
 #ifndef SPIFAST_TX_RING_SIZE
 #define SPIFAST_TX_RING_SIZE              65536  /* Tier 3: Worker×N → TX (MPSC) */

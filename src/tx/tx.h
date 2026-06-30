@@ -5,6 +5,7 @@
 #include <rte_common.h>
 #include <rte_ring.h>
 #include "dpdk/dpdk_init.h"   /* CACHE_LINE_SIZE, SPIFAST_TX_BURST_SIZE */
+#include "perf/perf_stats.h"  /* perf_stage_t                           */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Per-lcore statistics for the TX lcore  (SDD §2.7, §3.5)
@@ -30,6 +31,7 @@ typedef struct {
     uint16_t          port_id;       /* NIC port (single port design)       */
     uint16_t          tx_queue_id;   /* TX queue index; always 0 (SDD §2.1)*/
     tx_lcore_stats_t *stats;
+    perf_stage_t     *perf;          /* perf counters for this lcore (may be NULL) */
 } tx_ctx_t;
 
 /* ─────────────────────────────────────────────────────────────────────────────

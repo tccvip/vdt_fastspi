@@ -4,6 +4,7 @@
 #include <rte_ring.h>
 #include <rte_byteorder.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 
 #include "worker.h"
 #include "packet/pkt_ctx.h"    /* pkt_meta_read()                              */
@@ -39,6 +40,7 @@ int worker_lcore_func(void *arg)
     struct rte_ring           *tx_ring      = ctx->tx_ring;
     const flat_rule_table_t   *flat_rule_tbl = ctx->flat_rule_table;
     worker_lcore_stats_t      *stats        = ctx->stats;
+    uint64_t                   burst_count  = 0;
 
     struct rte_mbuf          *pkts[SPIFAST_WORKER_BURST];
     acl_key_t                 keys[SPIFAST_WORKER_BURST];
@@ -53,6 +55,10 @@ int worker_lcore_func(void *arg)
             continue;
 
         stats->received += nb;
+
+        /* Sampling: time every Nth burst for both full-worker and ACL-only. */
+        bool     do_sample = (burst_count % SPIFAST_PERF_SAMPLE_RATE == 0);
+        uint64_t t_worker  = (do_sample && ctx->perf_worker) ? rte_rdtsc() : 0;
 
         /* ── Step 2: build ACL key array from mbuf headroom metadata ──────── */
         for (unsigned int i = 0; i < nb; i++) {
@@ -69,7 +75,15 @@ int worker_lcore_func(void *arg)
         }
 
         /* ── Step 3: batch flat ACL classify — single sorted-rule scan ─────── */
-        flat_acl_match_burst(flat_rule_tbl, key_ptrs, results, nb);
+        if (do_sample && ctx->perf_acl) {
+            uint64_t t_acl = rte_rdtsc();
+            flat_acl_match_burst(flat_rule_tbl, key_ptrs, results, nb);
+            ctx->perf_acl->total_cycles  += rte_rdtsc() - t_acl;
+            ctx->perf_acl->total_packets += nb;
+            ctx->perf_acl->total_samples++;
+        } else {
+            flat_acl_match_burst(flat_rule_tbl, key_ptrs, results, nb);
+        }
 
         /* ── Steps 4–5: group accounting + dispatch ─────────────────────────── */
         unsigned int nb_tx = 0;
@@ -101,6 +115,13 @@ int worker_lcore_func(void *arg)
                 rte_pktmbuf_free(tx_burst[i]);
             stats->tx_ring_drop += nb_tx - nb_sent;
         }
+
+        if (do_sample && ctx->perf_worker) {
+            ctx->perf_worker->total_cycles  += rte_rdtsc() - t_worker;
+            ctx->perf_worker->total_packets += nb;
+            ctx->perf_worker->total_samples++;
+        }
+        burst_count++;
     }
 
     return 0;

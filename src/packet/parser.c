@@ -9,6 +9,7 @@
 #include <rte_ring.h>
 #include <rte_prefetch.h>
 #include <rte_hash_crc.h>
+#include <rte_cycles.h>
 
 #include "parser.h"
 
@@ -134,8 +135,9 @@ int parse_packet(struct rte_mbuf *mbuf, pkt_meta_t *meta)
  * ───────────────────────────────────────────────────────────────────────────── */
 int parser_lcore_func(void *arg)
 {
-    parser_ctx_t         *ctx   = (parser_ctx_t *)arg;
-    parser_lcore_stats_t *stats = ctx->stats;
+    parser_ctx_t         *ctx         = (parser_ctx_t *)arg;
+    parser_lcore_stats_t *stats       = ctx->stats;
+    uint64_t              burst_count = 0;
 
     struct rte_mbuf *pkts[SPIFAST_BURST_SIZE];
 
@@ -147,6 +149,11 @@ int parser_lcore_func(void *arg)
             continue;
 
         stats->received += nb;
+
+        /* Sampling: time every Nth burst (full parse loop). */
+        bool     do_sample = (ctx->perf != NULL) &&
+                             (burst_count % SPIFAST_PERF_SAMPLE_RATE == 0);
+        uint64_t t_parser  = do_sample ? rte_rdtsc() : 0;
 
         /* Pre-prime prefetch for the first PREFETCH_AHEAD packets so their
          * data is in-flight before the processing loop begins. */
@@ -177,6 +184,10 @@ int parser_lcore_func(void *arg)
              * keeping ACL Stage-2 context warm in its L1 cache (DD-14). */
             uint32_t worker_idx = rte_hash_crc(meta, sizeof(pkt_meta_t), 0)
                                   % ctx->num_workers;
+            // static uint32_t rr = 0;
+
+            // uint32_t worker_idx =
+            //         rr++ % ctx->num_workers;
 
             int rc = rte_ring_enqueue(ctx->worker_rings[worker_idx], pkts[i]);
             if (rc != 0) {
@@ -187,6 +198,13 @@ int parser_lcore_func(void *arg)
             }
             stats->dispatched++;
         }
+
+        if (do_sample) {
+            ctx->perf->total_cycles  += rte_rdtsc() - t_parser;
+            ctx->perf->total_packets += nb;
+            ctx->perf->total_samples++;
+        }
+        burst_count++;
     }
 
     return 0;

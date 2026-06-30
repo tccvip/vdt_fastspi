@@ -6,6 +6,7 @@
 #include <rte_ring.h>
 #include "dpdk/dpdk_init.h"       /* CACHE_LINE_SIZE, SPIFAST_* constants */
 #include "rule/rule_loader.h"     /* flat_rule_table_t                    */
+#include "perf/perf_stats.h"      /* perf_stage_t                         */
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Per-worker-lcore statistics  (SDD §2.6, §3.5)
@@ -38,6 +39,8 @@ typedef struct {
     uint32_t                 worker_idx;      /* index [0 .. num_workers)              */
     worker_lcore_stats_t    *stats;
     uint64_t                 group_hits[SPIFAST_MAX_GROUPS]; /* hit count per group_idx */
+    perf_stage_t            *perf_worker; /* full-burst worker time (may be NULL) */
+    perf_stage_t            *perf_acl;   /* ACL-only subset of worker time        */
 } worker_ctx_t;
 
 /* ─────────────────────────────────────────────────────────────────────────────

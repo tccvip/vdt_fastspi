@@ -93,7 +93,7 @@ int dpdk_init(int argc, char *argv[],
      *         1 TX queue sinking forwarded packets.  (SDD §2.1, §7.2) */
     char devargs[SPIFAST_MAX_PATH * 2 + 64];
     snprintf(devargs, sizeof(devargs),
-             "rx_pcap=%s,tx_pcap=/tmp/spifast_tx.pcap", cfg->pcap_path);
+             "rx_pcap=%s,tx_pcap=/dev/null", cfg->pcap_path);
 
     ret = rte_eal_hotplug_add("vdev", "net_pcap0", devargs);
     if (ret != 0)
@@ -177,7 +177,7 @@ int dpdk_init(int argc, char *argv[],
     res->tx_ring = rte_ring_create("spifast_tx_ring",
                                     SPIFAST_TX_RING_SIZE,
                                     SOCKET_ID_ANY,
-                                    RING_F_SP_ENQ | RING_F_SC_DEQ);
+                                    RING_F_SC_DEQ);
     if (res->tx_ring == NULL)
         rte_exit(EXIT_FAILURE,
                  "[SPIFAST ERROR] dpdk_init: rte_ring_create(tx_ring)"

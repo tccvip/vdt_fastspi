@@ -1,6 +1,7 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
+#include <rte_cycles.h>
 
 #include "tx.h"
 
@@ -30,9 +31,10 @@ extern volatile int g_shutdown_flag;
  * ───────────────────────────────────────────────────────────────────────────── */
 int tx_lcore_func(void *arg)
 {
-    tx_ctx_t        *ctx   = (tx_ctx_t *)arg;
-    struct rte_ring *ring  = ctx->tx_ring;
-    tx_lcore_stats_t *stats = ctx->stats;
+    tx_ctx_t         *ctx         = (tx_ctx_t *)arg;
+    struct rte_ring  *ring        = ctx->tx_ring;
+    tx_lcore_stats_t *stats       = ctx->stats;
+    uint64_t          burst_count = 0;
 
     struct rte_mbuf *pkts[SPIFAST_TX_BURST_SIZE];
     uint16_t         lens[SPIFAST_TX_BURST_SIZE];
@@ -47,8 +49,20 @@ int tx_lcore_func(void *arg)
         for (unsigned int i = 0; i < nb; i++)
             lens[i] = pkts[i]->pkt_len;
 
+        /* Sampling: time every Nth burst (rte_eth_tx_burst only). */
+        bool     do_sample = (ctx->perf != NULL) &&
+                             (burst_count % SPIFAST_PERF_SAMPLE_RATE == 0);
+        uint64_t t_tx      = do_sample ? rte_rdtsc() : 0;
+
         uint16_t nb_sent = rte_eth_tx_burst(
             ctx->port_id, ctx->tx_queue_id, pkts, (uint16_t)nb);
+
+        if (do_sample) {
+            ctx->perf->total_cycles  += rte_rdtsc() - t_tx;
+            ctx->perf->total_packets += nb;
+            ctx->perf->total_samples++;
+        }
+        burst_count++;
 
         stats->tx_packets += nb_sent;
         for (unsigned int i = 0; i < nb_sent; i++)

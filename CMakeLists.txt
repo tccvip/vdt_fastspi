@@ -44,6 +44,7 @@ set(SPIFAST_SOURCES
     src/tx/tx.c
     src/stats/stats.c
     src/logging/log.c
+    src/perf/perf_stats.c
 )
 
 add_executable(spifast ${SPIFAST_SOURCES})
